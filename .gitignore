@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Ultralytics / YOLO cache & run outputs
+runs/
+*.cache
+*.npy
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# OpenVINO / YOLO model binary weights (generate locally, see README)
+*.bin
+yolov8n_openvino_model/
+models/*.bin
+
+# Logs
+*.log

@@ -1,0 +1,7 @@
+numpy>=1.24
+opencv-python>=4.8
+matplotlib>=3.8
+openvino>=2024.0
+ultralytics>=8.0
+torch>=2.0
+torchvision>=0.15

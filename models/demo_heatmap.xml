@@ -1,0 +1,92 @@
+<?xml version="1.0"?>
+<net name="thermal_heatmap_model" version="11">
+	<layers>
+		<layer id="0" name="input_image" type="Parameter" version="opset1">
+			<data shape="1,1,240,320" element_type="f32" />
+			<output>
+				<port id="0" precision="FP32" names="input_image">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="1" name="Constant_2_compressed" type="Const" version="opset1">
+			<data element_type="f16" shape="" offset="0" size="2" />
+			<output>
+				<port id="0" precision="FP16" />
+			</output>
+		</layer>
+		<layer id="2" name="Constant_2" type="Convert" version="opset1">
+			<data destination_type="f32" />
+			<rt_info>
+				<attribute name="decompression" version="0" />
+			</rt_info>
+			<input>
+				<port id="0" precision="FP16" />
+			</input>
+			<output>
+				<port id="1" precision="FP32" />
+			</output>
+		</layer>
+		<layer id="3" name="Add_3" type="Add" version="opset1">
+			<data auto_broadcast="numpy" />
+			<input>
+				<port id="0" precision="FP32">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+				<port id="1" precision="FP32" />
+			</input>
+			<output>
+				<port id="2" precision="FP32">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="4" name="Relu_4" type="ReLU" version="opset1">
+			<input>
+				<port id="0" precision="FP32">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+			</input>
+			<output>
+				<port id="1" precision="FP32" names="Result_5">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="5" name="Result_5" type="Result" version="opset1" output_names="Result_5">
+			<input>
+				<port id="0" precision="FP32">
+					<dim>1</dim>
+					<dim>1</dim>
+					<dim>240</dim>
+					<dim>320</dim>
+				</port>
+			</input>
+		</layer>
+	</layers>
+	<edges>
+		<edge from-layer="0" from-port="0" to-layer="3" to-port="0" />
+		<edge from-layer="1" from-port="0" to-layer="2" to-port="0" />
+		<edge from-layer="2" from-port="1" to-layer="3" to-port="1" />
+		<edge from-layer="3" from-port="2" to-layer="4" to-port="0" />
+		<edge from-layer="4" from-port="1" to-layer="5" to-port="0" />
+	</edges>
+	<rt_info>
+		<info name="OpenVINO Runtime" value="2026.2.1-21919-ede283a88e3-releases/2026/2" />
+	</rt_info>
+</net>
