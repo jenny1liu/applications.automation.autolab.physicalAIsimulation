@@ -40,6 +40,11 @@ C: dict[str, str] = {
 }
 FF = "Segoe UI"
 UI_STATE_FILE = ".physicalai_ui_state.json"
+MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "opencv": "OpenCV",
+    "pytorch": "PyTorch (YOLOv8)",
+    "openvino": "OpenVINO (YOLOv8)",
+}
 
 
 class ThermalHotspotDemo:
@@ -69,6 +74,10 @@ class ThermalHotspotDemo:
         self._img_figs: dict[str, Figure] = {}
         self._img_cvs: dict[str, FigureCanvasTkAgg] = {}
         self._sub_vars: dict[str, tk.StringVar] = {}
+        self._robot_xyz_vars: dict[str, tk.StringVar] = {
+            k: tk.StringVar(value="X —  Y —  Z —")
+            for k in ("opencv", "pytorch", "openvino")
+        }
         self.hotspot_count: Optional[tk.Scale] = None
         self.noise_scale: Optional[tk.Scale] = None
         self.benchmark_samples: Optional[tk.IntVar] = None
@@ -397,9 +406,9 @@ class ThermalHotspotDemo:
         for key, title, r, c, cs, color in [
             ("thermal",  "Input Thermal", 0, 0, 2, "#6366F1"),
             ("mask",     "Ground Truth",  0, 2, 1, "#0EA5E9"),
-            ("opencv",   "OpenCV",        1, 0, 1, "#10B981"),
-            ("pytorch",  "PyTorch",       1, 1, 1, "#F59E0B"),
-            ("openvino", "OpenVINO",      1, 2, 1, "#EC4899"),
+            ("opencv",   MODEL_DISPLAY_NAMES["opencv"],   1, 0, 1, "#10B981"),
+            ("pytorch",  MODEL_DISPLAY_NAMES["pytorch"],  1, 1, 1, "#F59E0B"),
+            ("openvino", MODEL_DISPLAY_NAMES["openvino"], 1, 2, 1, "#EC4899"),
         ]:
             self._make_img_card(key, title, r, c, cs, color)
 
@@ -475,6 +484,14 @@ class ThermalHotspotDemo:
                          font=(FF, value_size, "bold")).pack(side=tk.LEFT)
                 tk.Label(vrow, text=f" {unit}", bg="#1B1F33", fg=C["muted"],
                          font=(FF, 7)).pack(side=tk.LEFT, pady=(0, 1))
+
+                xyz_row = tk.Frame(card, bg=C["card"])
+                xyz_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+                tk.Label(xyz_row, text="Robot", bg=C["card"], fg=C["dim"],
+                            font=(FF, 7, "bold")).pack(side=tk.LEFT)
+                tk.Label(xyz_row, textvariable=self._robot_xyz_vars[key],
+                            bg=C["card"], fg=C["muted"],
+                            font=("Consolas", 8)).pack(side=tk.LEFT, padx=(8, 0))
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -570,6 +587,7 @@ class ThermalHotspotDemo:
             self._kpi[f"{k}_fps"].set("—")
             self._kpi[f"{k}_acc"].set("—")
             self._kpi[f"{k}_conf"].set("—")
+            self._robot_xyz_vars[k].set("X —  Y —  Z —")
         if not self._vis_frame.winfo_ismapped():
             self._vis_frame.grid()
         self._set_status("Frame generated")
@@ -802,9 +820,12 @@ class ThermalHotspotDemo:
                         subtitle=(f"{r.inference_time_ms:.1f}ms  "
                                   f"{err:.1f}px  confidence {r.confidence:.2f}"))
             robot = self.robot_mapper.pixel_to_robot(r.center_x, r.center_y)
+            self._robot_xyz_vars[key].set(
+                f"X {robot.X:.3f}  Y {robot.Y:.3f}  Z {robot.Z:.3f}"
+            )
             is_best = abs(err - best_err) < 0.01
             tagged += [
-                ("key",   f"{key.upper()}\n"),
+                ("key",   f"{MODEL_DISPLAY_NAMES[key].upper()}\n"),
                 ("muted", "  Latency    "),
                 ("val",   f"{r.inference_time_ms:.2f} ms"),
                 ("muted", f"  Frame Rate {fps:.0f} fps\n"),
