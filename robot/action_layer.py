@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import sqrt
 from typing import Optional
@@ -40,16 +41,86 @@ class RobotExecutionConfig:
     camera_target_z: float = 0.14
 
 
-class PyBulletActionExecutor:
-    """Execute ActionCommand using a PyBullet robot and return ActionResult."""
+# ---------------------------------------------------------------------------
+# Strategy interface
+# ---------------------------------------------------------------------------
 
-    def __init__(self, config: Optional[RobotExecutionConfig] = None):
-        self.config = config or RobotExecutionConfig()
+class RobotControlStrategy(ABC):
+    """Abstract hardware backend.
+
+    Implement this interface to swap between simulation and a real robot
+    without touching the action execution logic.
+
+    Example future implementation::
+
+        class FrankaRealStrategy(RobotControlStrategy):
+            def move_end_effector(self, x, y, z, steps=None):
+                joint_angles = franka_ik.solve(x, y, z)
+                self.robot.move_joints(joint_angles)
+            ...
+    """
+
+    @property
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Return True if the runtime dependency (e.g. pybullet) is installed."""
+
+    @property
+    @abstractmethod
+    def is_ready(self) -> bool:
+        """Return True after both setup() and configure() have succeeded."""
+
+    @abstractmethod
+    def setup(self) -> None:
+        """Initialize the hardware connection and environment."""
+
+    @abstractmethod
+    def configure(self, urdf_path: Optional[str] = None) -> None:
+        """Load the robot model."""
+
+    @abstractmethod
+    def move_end_effector(self, x: float, y: float, z: float, steps: Optional[int] = None) -> None:
+        """Move the end effector to (x, y, z) in the robot base frame."""
+
+    @abstractmethod
+    def set_gripper(self, opening: float) -> None:
+        """Set the gripper opening width in metres."""
+
+    @abstractmethod
+    def get_achieved_pose(self) -> tuple[float, float, float]:
+        """Return the current end-effector position (ax, ay, az)."""
+
+    @abstractmethod
+    def settle(self, steps: int) -> None:
+        """Advance the simulation (or wait) so the robot reaches steady state."""
+
+    @abstractmethod
+    def shutdown(self) -> None:
+        """Release all hardware/simulation resources."""
+
+
+# ---------------------------------------------------------------------------
+# PyBullet strategy (simulation)
+# ---------------------------------------------------------------------------
+
+class PyBulletStrategy(RobotControlStrategy):
+    """RobotControlStrategy backed by the PyBullet physics simulator."""
+
+    def __init__(self, config: RobotExecutionConfig):
+        self.config = config
         self.client_id: Optional[int] = None
         self.robot_id: Optional[int] = None
         self.plane_id: Optional[int] = None
 
-    def setup_environment(self) -> None:
+    @property
+    def is_available(self) -> bool:
+        return p is not None
+
+    @property
+    def is_ready(self) -> bool:
+        return p is not None and self.robot_id is not None
+
+    def setup(self) -> None:
         if p is None or pybullet_data is None:
             raise RuntimeError("pybullet is not installed. Run: pip install pybullet")
 
@@ -89,18 +160,18 @@ class PyBulletActionExecutor:
             ],
         )
 
-    def configure_robot_model(self, urdf_path: Optional[str] = None) -> None:
+    def configure(self, urdf_path: Optional[str] = None) -> None:
         if p is None:
             raise RuntimeError("pybullet is not available")
         if self.client_id is None:
-            raise RuntimeError("setup_environment() must be called before configure_robot_model()")
+            raise RuntimeError("setup() must be called before configure()")
 
         self.robot_id = p.loadURDF(
             urdf_path or self.config.robot_urdf,
             useFixedBase=self.config.use_fixed_base,
         )
 
-    def _move_end_effector(self, x: float, y: float, z: float, steps: Optional[int] = None) -> None:
+    def move_end_effector(self, x: float, y: float, z: float, steps: Optional[int] = None) -> None:
         if p is None or self.robot_id is None:
             raise RuntimeError("Robot model is not configured")
 
@@ -121,7 +192,7 @@ class PyBulletActionExecutor:
         for _ in range(steps or self.config.ik_steps):
             p.stepSimulation()
 
-    def _set_gripper(self, opening: float) -> None:
+    def set_gripper(self, opening: float) -> None:
         if p is None or self.robot_id is None:
             raise RuntimeError("Robot model is not configured")
 
@@ -137,52 +208,98 @@ class PyBulletActionExecutor:
         for _ in range(self.config.gripper_steps):
             p.stepSimulation()
 
-    def _get_achieved_pose(self) -> tuple[float, float, float]:
+    def get_achieved_pose(self) -> tuple[float, float, float]:
         if p is None or self.robot_id is None:
             raise RuntimeError("Robot model is not configured")
         link_state = p.getLinkState(self.robot_id, self.config.end_effector_link_index)
         ax, ay, az = link_state[0]
         return float(ax), float(ay), float(az)
 
+    def settle(self, steps: int) -> None:
+        if p is None:
+            return
+        for _ in range(steps):
+            p.stepSimulation()
+
+    def shutdown(self) -> None:
+        if p is None:
+            return
+        if self.client_id is not None:
+            p.disconnect(self.client_id)
+            self.client_id = None
+            self.robot_id = None
+            self.plane_id = None
+
+
+# ---------------------------------------------------------------------------
+# Action executor (strategy-agnostic)
+# ---------------------------------------------------------------------------
+
+class ActionExecutor:
+    """Execute ActionCommand using a pluggable RobotControlStrategy.
+
+    To target a real robot instead of the simulator, supply a different
+    strategy::
+
+        executor = ActionExecutor(
+            strategy=FrankaRealStrategy(...),
+            config=RobotExecutionConfig(gui=False),
+        )
+    """
+
+    def __init__(
+        self,
+        strategy: RobotControlStrategy,
+        config: Optional[RobotExecutionConfig] = None,
+    ):
+        self.strategy = strategy
+        self.config = config or RobotExecutionConfig()
+
+    def setup_environment(self) -> None:
+        self.strategy.setup()
+
+    def configure_robot_model(self, urdf_path: Optional[str] = None) -> None:
+        self.strategy.configure(urdf_path)
+
     def _execute_move(self, command: ActionCommand) -> tuple[float, float, float]:
-        self._move_end_effector(command.target.x, command.target.y, command.target.z)
-        return self._get_achieved_pose()
+        self.strategy.move_end_effector(command.target.x, command.target.y, command.target.z)
+        return self.strategy.get_achieved_pose()
 
     def _execute_pick(self, command: ActionCommand) -> tuple[float, float, float]:
         tx, ty, tz = command.target.x, command.target.y, command.target.z
         approach_z = tz + self.config.approach_offset_m
 
-        self._set_gripper(self.config.gripper_open_position)
-        self._move_end_effector(tx, ty, approach_z)
-        self._move_end_effector(tx, ty, tz)
-        self._set_gripper(self.config.gripper_close_position)
-        self._move_end_effector(tx, ty, tz + self.config.lift_offset_m)
-        return self._get_achieved_pose()
+        self.strategy.set_gripper(self.config.gripper_open_position)
+        self.strategy.move_end_effector(tx, ty, approach_z)
+        self.strategy.move_end_effector(tx, ty, tz)
+        self.strategy.set_gripper(self.config.gripper_close_position)
+        self.strategy.move_end_effector(tx, ty, tz + self.config.lift_offset_m)
+        return self.strategy.get_achieved_pose()
 
     def _execute_place(self, command: ActionCommand) -> tuple[float, float, float]:
         tx, ty, tz = command.target.x, command.target.y, command.target.z
         approach_z = tz + self.config.approach_offset_m
         place_z = tz + self.config.place_clearance_m
 
-        self._move_end_effector(tx, ty, approach_z)
-        self._move_end_effector(tx, ty, place_z)
-        self._set_gripper(self.config.gripper_open_position)
-        self._move_end_effector(tx, ty, tz + self.config.lift_offset_m)
-        return self._get_achieved_pose()
+        self.strategy.move_end_effector(tx, ty, approach_z)
+        self.strategy.move_end_effector(tx, ty, place_z)
+        self.strategy.set_gripper(self.config.gripper_open_position)
+        self.strategy.move_end_effector(tx, ty, tz + self.config.lift_offset_m)
+        return self.strategy.get_achieved_pose()
 
     def validate_robot_interface(self, command: ActionCommand) -> Optional[str]:
         if command.target.coordinate_frame != CoordinateFrame.ROBOT_BASE:
             return "ActionCommand.target must be in robot_base frame"
-        if self.robot_id is None:
+        if not self.strategy.is_ready:
             return "Robot model is not configured. Call configure_robot_model() first"
         return None
 
     def execute_action(self, command: ActionCommand) -> ActionResult:
-        if p is None:
+        if not self.strategy.is_available:
             return ActionResult(
                 task_id=command.task_id,
                 status=ActionStatus.FAILED,
-                message="pybullet is not installed",
+                message="robot backend is not available (missing dependency)",
             )
 
         error_message = self.validate_robot_interface(command)
@@ -209,13 +326,12 @@ class PyBulletActionExecutor:
                     message=f"unsupported action type: {command.action_type.value}",
                 )
 
-            for _ in range(self.config.settle_steps):
-                p.stepSimulation()
+            self.strategy.settle(self.config.settle_steps)
         except Exception as ex:
             return ActionResult(
                 task_id=command.task_id,
                 status=ActionStatus.FAILED,
-                message=f"pybullet execution failed: {ex}",
+                message=f"robot execution failed: {ex}",
             )
 
         error_mm = 1000.0 * sqrt((ax - tx) ** 2 + (ay - ty) ** 2 + (az - tz) ** 2)
@@ -231,13 +347,24 @@ class PyBulletActionExecutor:
         )
 
     def shutdown(self) -> None:
-        if p is None:
-            return
-        if self.client_id is not None:
-            p.disconnect(self.client_id)
-            self.client_id = None
-            self.robot_id = None
-            self.plane_id = None
+        self.strategy.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible convenience class
+# ---------------------------------------------------------------------------
+
+class PyBulletActionExecutor(ActionExecutor):
+    """ActionExecutor pre-configured with PyBulletStrategy.
+
+    Existing code that imports and instantiates ``PyBulletActionExecutor``
+    continues to work unchanged.  To target a different robot backend,
+    instantiate ``ActionExecutor`` directly with your own strategy.
+    """
+
+    def __init__(self, config: Optional[RobotExecutionConfig] = None):
+        cfg = config or RobotExecutionConfig()
+        super().__init__(strategy=PyBulletStrategy(cfg), config=cfg)
 
 
 def run_smoke_demo() -> None:
