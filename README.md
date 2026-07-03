@@ -67,7 +67,7 @@ PhysicalAI/
 │   └── interfaces.py               # Shared contracts for cross-module workflow
 ├── tests/
 ├── requirements.txt                # Python dependencies
-├── run_thermal_detction.bat        # Thermal UI launch script
+├── run_thermal_detection.bat       # Thermal UI launch script
 ├── run_robot.bat                   # Robot UI launch script
 └── README.md
 ```
@@ -133,7 +133,7 @@ python -m thermal.create_openvino_model --output models/demo_heatmap.xml
 ```bash
 python -m thermal.ui
 # or on Windows:
-run_thermal_detction.bat
+run_thermal_detection.bat
 ```
 
 ### 3. Workflow
