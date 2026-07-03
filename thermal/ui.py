@@ -1395,7 +1395,14 @@ class ThermalHotspotDemo:
         card = tk.Frame(self._vis_frame, bg=C["card"],
                          highlightbackground=C["border"],
                          highlightthickness=1)
-        if row == 1 and colspan == 1:
+        # Keep top-row and bottom-row card boundaries vertically aligned:
+        # thermal(openCV+pytorch span) aligns with openCV/pytorch,
+        # and reference result aligns with openvino.
+        if key == "thermal":
+            pad_x = (4, 4)
+        elif key == "mask":
+            pad_x = (4, 4)
+        elif row == 1 and colspan == 1:
             pad_x = (4, 4)
         else:
             pad_x = (0 if col == 0 else 8, 0)
