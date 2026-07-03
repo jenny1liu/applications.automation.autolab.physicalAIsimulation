@@ -30,12 +30,18 @@ class OpenVINOYOLODetector:
         conf_threshold: float = 0.12,
         iou_threshold: float = 0.50,
         imgsz: int = 640,
+        inference_precision_hint: str = "F32",
     ):
         self.model_path = model_path
         self.device = device
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.imgsz = imgsz
+        self.inference_precision_hint = inference_precision_hint
+        self.requested_precision_hint = self._normalize_precision_label(inference_precision_hint)
+        self.applied_precision_hint = "Unknown"
+        self.precision_hint_compile_value = ""
+        self.used_precision_fallback = False
         self.ultralytics_imgsz_hw: Optional[tuple[int, int]] = None
 
         self.ultralytics_model: Optional[object] = None
@@ -91,6 +97,97 @@ class OpenVINOYOLODetector:
         """Ultralytics OpenVINO backend here is only reliable for CPU device strings."""
         return str(self.device).strip().upper() == "CPU"
 
+    def _build_compile_config(self) -> dict[str, str]:
+        """Build compile-time config for OpenVINO runtime precision tests."""
+        raw_hint = str(self.inference_precision_hint).strip()
+        if not raw_hint:
+            return {}
+
+        requested_device = str(self.device).strip().upper()
+        if requested_device == "AUTO":
+            # AUTO can dispatch to different plugins with different precision support.
+            return {}
+
+        hint_key = raw_hint.lower()
+        precision_map = {
+            "bf16": "bf16",
+            "f32": "f32",
+            "f16": "f16",
+            "int8": "i8",
+            "i8": "i8",
+        }
+        precision_hint = precision_map.get(hint_key)
+        if precision_hint is None:
+            return {}
+
+        # Intel NPU plugin does not support f32 precision hint.
+        if requested_device == "NPU" and precision_hint == "f32":
+            print("OpenVINO NPU does not support F32 hint, auto-switching to F16.")
+            precision_hint = "f16"
+
+        # Intel CPU plugin commonly rejects i8 precision hint for floating-point precision option.
+        if requested_device == "CPU" and precision_hint == "i8":
+            print("OpenVINO CPU does not support Int8 hint, auto-switching to F16.")
+            precision_hint = "f16"
+
+        # Intel GPU plugin does not support i8 inference precision hint.
+        if requested_device == "GPU" and precision_hint == "i8":
+            print("OpenVINO GPU does not support Int8 hint, auto-switching to F16.")
+            precision_hint = "f16"
+
+        # Keep config explicit so GPU/NPU runs can be compared with fixed precision hints.
+        return {"INFERENCE_PRECISION_HINT": precision_hint}
+
+    @staticmethod
+    def _normalize_precision_label(value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized == "bf16":
+            return "BF16"
+        if normalized == "f32":
+            return "F32"
+        if normalized == "f16":
+            return "F16"
+        if normalized in {"int8", "i8"}:
+            return "Int8"
+        return "Unknown"
+
+    def _read_compiled_precision_hint(self) -> str:
+        """Best-effort read of precision hint applied by runtime/plugin."""
+        if self.compiled_model is None:
+            return "Unknown"
+
+        candidates = (
+            "INFERENCE_PRECISION_HINT",
+            "inference_precision_hint",
+            "INFERENCE_PRECISION",
+            "inference_precision",
+        )
+        for key in candidates:
+            try:
+                value = self.compiled_model.get_property(key)
+            except Exception:
+                continue
+
+            if value is None:
+                continue
+
+            text = str(value).strip()
+            if not text:
+                continue
+            return self._normalize_precision_label(text)
+
+        return "Unknown"
+
+    def get_precision_hint_debug_text(self) -> str:
+        applied = self.applied_precision_hint
+        requested = self.requested_precision_hint
+        fallback_text = "Yes" if self.used_precision_fallback else "No"
+        compile_hint = self.precision_hint_compile_value or "none"
+        return (
+            f"requested={requested}, applied={applied}, "
+            f"compile_hint={compile_hint}, fallback={fallback_text}"
+        )
+
     def _load_model(self) -> None:
         model_file = Path(self.model_path)
         if not model_file.exists():
@@ -120,13 +217,32 @@ class OpenVINOYOLODetector:
 
         core = ov.Core()
         model = core.read_model(str(model_file))
-        self.compiled_model = core.compile_model(model, self.device)
+        config = self._build_compile_config()
+        self.requested_precision_hint = self._normalize_precision_label(self.inference_precision_hint)
+        self.precision_hint_compile_value = str(config.get("INFERENCE_PRECISION_HINT", "")).strip()
+        self.used_precision_fallback = False
+        try:
+            self.compiled_model = core.compile_model(model, self.device, config)
+        except Exception as exc:
+            # Some devices/plugins may reject precision hints; fallback keeps runtime usable.
+            if config:
+                print(
+                    "OpenVINO compile with precision hint failed "
+                    f"({config.get('INFERENCE_PRECISION_HINT')}): {exc}. "
+                    "Retrying without hint."
+                )
+                self.used_precision_fallback = True
+                self.compiled_model = core.compile_model(model, self.device)
+            else:
+                raise
+        self.applied_precision_hint = self._read_compiled_precision_hint()
         self.input_port = self.compiled_model.input(0)
         self.output_port = self.compiled_model.output(0)
         if self.ultralytics_model is not None and self._can_use_ultralytics_openvino():
             self._log_runtime_selection("Ultralytics OpenVINO")
         else:
             self._log_runtime_selection("raw runtime")
+        print(f"OpenVINO precision hint status: {self.get_precision_hint_debug_text()}")
 
     def detect(self, thermal_image: np.ndarray) -> OpenVINODetectionResult:
         """Run OpenVINO YOLOv8 detection on thermal image."""

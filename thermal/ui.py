@@ -369,6 +369,7 @@ class ThermalHotspotDemo:
 
         self._status_var = tk.StringVar(value="Initializing…")
         self.openvinoDeviceVar = tk.StringVar(value="CPU")
+        self.openvinoPrecisionVar = tk.StringVar(value="F32")
         self._kpi: dict[str, tk.StringVar] = {
             k: tk.StringVar(value="—")
             for k in (
@@ -410,6 +411,22 @@ class ThermalHotspotDemo:
         self._sidebarResizeStartWidth = 200
         self._sidebarResizing = False
         self._sidebarCollapsed = False
+        self._openvinoPrecisionMenu: Optional[tk.Menu] = None
+
+        try:
+            state = self._load_ui_state()
+            if isinstance(state, dict):
+                self.openvinoDeviceVar.set(
+                    self._normalize_openvino_device(str(state.get("openvinoDevice", self.openvinoDeviceVar.get())))
+                )
+                self.openvinoPrecisionVar.set(
+                    self._normalize_openvino_precision(
+                        str(state.get("openvinoPrecision", self.openvinoPrecisionVar.get()))
+                    )
+                )
+        except Exception:
+            # Keep defaults if state is missing or malformed.
+            pass
 
         self._setup_ui()
         self._configure_window_size()
@@ -526,6 +543,8 @@ class ThermalHotspotDemo:
             "geometry": self.root.winfo_geometry(),
             "sidebarWidth": int(sidebarWidth),
             "sidebarCollapsed": bool(self._sidebarCollapsed),
+            "openvinoDevice": self._normalize_openvino_device(self.openvinoDeviceVar.get()),
+            "openvinoPrecision": self._normalize_openvino_precision(self.openvinoPrecisionVar.get()),
         }
         try:
             path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -794,6 +813,87 @@ class ThermalHotspotDemo:
         openvinoValueLabel.bind("<Leave>", _ov_hover_leave)
         openvinoArrowLabel.bind("<Leave>", _ov_hover_leave)
 
+        precisionFrame = tk.Frame(ovCard, bg=C["sidebar_card"])
+        precisionFrame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        tk.Label(precisionFrame, text="Inference Precision", bg=C["sidebar_card"], fg=C["text"],
+                 font=(FF, 9, "bold")).pack(anchor=tk.W)
+        self._openvinoPrecisionMenuTextVar = tk.StringVar(value=self.openvinoPrecisionVar.get())
+
+        precisionDropdown = tk.Frame(precisionFrame, bg=C["accent"], bd=0)
+        precisionDropdown.pack(fill=tk.X, pady=(8, 0), ipady=2)
+
+        precisionValueLabel = tk.Label(
+            precisionDropdown,
+            textvariable=self._openvinoPrecisionMenuTextVar,
+            bg=C["accent"],
+            fg=C["text"],
+            font=(FF, 9, "bold"),
+            anchor="w",
+            padx=10,
+            pady=5,
+            cursor="hand2",
+        )
+        precisionValueLabel.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        precisionArrowLabel = tk.Label(
+            precisionDropdown,
+            text="▾",
+            bg=C["accent"],
+            fg=C["text"],
+            font=(FF, 10, "bold"),
+            padx=10,
+            pady=5,
+            cursor="hand2",
+        )
+        precisionArrowLabel.pack(side=tk.RIGHT)
+
+        precisionMenu = tk.Menu(precisionDropdown, tearoff=0)
+        precisionMenu.config(
+            bg="#23283A",
+            fg=C["text"],
+            activebackground=C["accent"],
+            activeforeground=C["text"],
+            bd=0,
+            font=(FF, 9),
+        )
+
+        def on_select_openvino_precision(option: str) -> None:
+            self._on_openvino_precision_select(option)
+
+        self._openvinoPrecisionMenu = precisionMenu
+        self._refresh_openvino_precision_menu()
+
+        def _open_precision_menu(_event=None) -> None:
+            try:
+                precisionMenu.tk_popup(
+                    precisionDropdown.winfo_rootx(),
+                    precisionDropdown.winfo_rooty() + precisionDropdown.winfo_height(),
+                )
+            finally:
+                precisionMenu.grab_release()
+
+        def _precision_hover_enter(_event=None) -> None:
+            precisionDropdown.config(bg=C["accent_dim"])
+            precisionValueLabel.config(bg=C["accent_dim"])
+            precisionArrowLabel.config(bg=C["accent_dim"])
+
+        def _precision_hover_leave(_event=None) -> None:
+            precisionDropdown.config(bg=C["accent"])
+            precisionValueLabel.config(bg=C["accent"])
+            precisionArrowLabel.config(bg=C["accent"])
+
+        precisionDropdown.bind("<Button-1>", _open_precision_menu)
+        precisionValueLabel.bind("<Button-1>", _open_precision_menu)
+        precisionArrowLabel.bind("<Button-1>", _open_precision_menu)
+
+        precisionDropdown.bind("<Enter>", _precision_hover_enter)
+        precisionValueLabel.bind("<Enter>", _precision_hover_enter)
+        precisionArrowLabel.bind("<Enter>", _precision_hover_enter)
+
+        precisionDropdown.bind("<Leave>", _precision_hover_leave)
+        precisionValueLabel.bind("<Leave>", _precision_hover_leave)
+        precisionArrowLabel.bind("<Leave>", _precision_hover_leave)
+
         tk.Label(sb, text="BATCH RUN", bg=C["sidebar"], fg=C["sidebar_accent"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W, padx=10, pady=(2, 8))
 
@@ -1045,16 +1145,84 @@ class ThermalHotspotDemo:
             return normalized
         return "CPU"
 
+    @staticmethod
+    def _normalize_openvino_precision(value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized == "bf16":
+            return "BF16"
+        if normalized == "f32":
+            return "F32"
+        if normalized == "f16":
+            return "F16"
+        if normalized in {"int8", "i8"}:
+            return "Int8"
+        return "F32"
+
+    def _get_openvino_precision_options_for_device(self, device: str) -> tuple[str, ...]:
+        normalized = self._normalize_openvino_device(device)
+        if normalized == "GPU":
+            return ("F32", "F16")
+        if normalized == "NPU":
+            return ("F16", "Int8")
+        if normalized == "AUTO":
+            # Keep AUTO conservative because target plugin may vary at runtime.
+            return ("F32", "F16")
+        return ("BF16", "F32", "F16")
+
+    def _refresh_openvino_precision_menu(self) -> None:
+        if self._openvinoPrecisionMenu is None:
+            return
+
+        options = self._get_openvino_precision_options_for_device(self.openvinoDeviceVar.get())
+        self._openvinoPrecisionMenu.delete(0, tk.END)
+        for option in options:
+            self._openvinoPrecisionMenu.add_command(
+                label=f"  {option:<8}",
+                command=lambda selected=option: self._on_openvino_precision_select(selected),
+            )
+
+        normalized = self._normalize_openvino_precision(self.openvinoPrecisionVar.get())
+        if normalized not in options:
+            normalized = options[0]
+            self.openvinoPrecisionVar.set(normalized)
+
+        if hasattr(self, "_openvinoPrecisionMenuTextVar"):
+            self._openvinoPrecisionMenuTextVar.set(normalized)
+
     def _on_openvino_device_select(self, selected: str) -> None:
         """Apply OpenVINO device selection for next model load."""
         try:
             normalized = self._normalize_openvino_device(selected)
+            previous_precision = self._normalize_openvino_precision(self.openvinoPrecisionVar.get())
             self.openvinoDeviceVar.set(normalized)
             if hasattr(self, "_openvinoMenuTextVar"):
                 self._openvinoMenuTextVar.set(normalized)
+            self._refresh_openvino_precision_menu()
+            current_precision = self._normalize_openvino_precision(self.openvinoPrecisionVar.get())
             # Force re-load on next run so selected device is actually used.
             self.yolo_openvino_detector = None
-            self._set_status(f"OpenVINO device set to {normalized} (reload on next run)")
+            if current_precision != previous_precision:
+                self._set_status(
+                    f"OpenVINO device set to {normalized}; precision adjusted to {current_precision} (reload on next run)"
+                )
+            else:
+                self._set_status(f"OpenVINO device set to {normalized} (reload on next run)")
+        except Exception as exc:
+            messagebox.showerror("OpenVINO Setting Error", str(exc))
+
+    def _on_openvino_precision_select(self, selected: str) -> None:
+        """Apply OpenVINO precision hint for next model load."""
+        try:
+            normalized = self._normalize_openvino_precision(selected)
+            allowed = self._get_openvino_precision_options_for_device(self.openvinoDeviceVar.get())
+            if normalized not in allowed:
+                normalized = allowed[0]
+            self.openvinoPrecisionVar.set(normalized)
+            if hasattr(self, "_openvinoPrecisionMenuTextVar"):
+                self._openvinoPrecisionMenuTextVar.set(normalized)
+            # Force re-load on next run so selected precision is actually used.
+            self.yolo_openvino_detector = None
+            self._set_status(f"OpenVINO precision set to {normalized} (reload on next run)")
         except Exception as exc:
             messagebox.showerror("OpenVINO Setting Error", str(exc))
 
@@ -1910,11 +2078,18 @@ class ThermalHotspotDemo:
                     messagebox.showerror("Error", "OpenVINO model not found.")
                 return
             selectedDevice = self._normalize_openvino_device(self.openvinoDeviceVar.get())
+            selectedPrecision = self._normalize_openvino_precision(self.openvinoPrecisionVar.get())
             self.yolo_openvino_detector = OpenVINOYOLODetector(
-                model_path=str(resolved.resolve()), device=selectedDevice)
+                model_path=str(resolved.resolve()),
+                device=selectedDevice,
+                inference_precision_hint=selectedPrecision,
+            )
             if show_success:
+                precisionDebugText = self.yolo_openvino_detector.get_precision_hint_debug_text()
                 messagebox.showinfo("Success",
-                                    f"OpenVINO model loaded on {selectedDevice}!\n{resolved}")
+                                    f"OpenVINO model loaded on {selectedDevice} ({selectedPrecision})!\n"
+                                    f"{resolved}\n"
+                                    f"Precision: {precisionDebugText}")
         except Exception as e:
             if show_errors:
                 messagebox.showerror("Error", str(e))
