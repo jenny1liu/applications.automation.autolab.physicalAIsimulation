@@ -17,6 +17,7 @@ class OpenVINODetectionResult:
     confidence: float
     inference_time_ms: float
     max_temperature: float
+    execution_devices: tuple[str, ...]
 
 
 class OpenVINOYOLODetector:
@@ -43,21 +44,72 @@ class OpenVINOYOLODetector:
         self.output_port = None
         self._load_model()
 
+    def _get_execution_devices(self) -> list[str]:
+        """Return actual execution devices used by compiled OpenVINO model when available."""
+        if self.compiled_model is None:
+            return []
+
+        candidates = ("EXECUTION_DEVICES", "execution_devices")
+        for key in candidates:
+            try:
+                value = self.compiled_model.get_property(key)
+            except Exception:
+                continue
+
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                return [part.strip() for part in text.split(",") if part.strip()]
+
+            try:
+                return [str(part).strip() for part in value if str(part).strip()]
+            except Exception:
+                text = str(value).strip()
+                if text:
+                    return [text]
+
+        return []
+
+    def _log_runtime_selection(self, backendName: str) -> None:
+        """Print requested vs actual device selection for easier runtime debugging."""
+        requestedDevice = str(self.device).strip().upper() or "CPU"
+        executionDevices = self._get_execution_devices()
+        actualDeviceText = ", ".join(executionDevices) if executionDevices else requestedDevice
+        print(
+            f"Using OpenVINO {backendName} backend on requested device '{requestedDevice}' "
+            f"(actual execution devices: {actualDeviceText})"
+        )
+
+    def get_execution_device_text(self) -> str:
+        executionDevices = self._get_execution_devices()
+        if executionDevices:
+            return ", ".join(executionDevices)
+        return str(self.device).strip().upper() or "CPU"
+
+    def _can_use_ultralytics_openvino(self) -> bool:
+        """Ultralytics OpenVINO backend here is only reliable for CPU device strings."""
+        return str(self.device).strip().upper() == "CPU"
+
     def _load_model(self) -> None:
         model_file = Path(self.model_path)
         if not model_file.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
 
         # Prefer Ultralytics runtime when model source is in a supported OpenVINO layout.
-        try:
-            from ultralytics import YOLO
+        if self._can_use_ultralytics_openvino():
+            try:
+                from ultralytics import YOLO
 
-            model_source = self._resolve_ultralytics_openvino_source(model_file)
-            if model_source is not None:
-                self.ultralytics_model = YOLO(model_source, task="detect")
-                self.ultralytics_imgsz_hw = self._resolve_model_input_hw(model_file)
-                self._warmup_ultralytics_openvino()
-        except Exception:
+                model_source = self._resolve_ultralytics_openvino_source(model_file)
+                if model_source is not None:
+                    self.ultralytics_model = YOLO(model_source, task="detect")
+                    self.ultralytics_imgsz_hw = self._resolve_model_input_hw(model_file)
+                    self._warmup_ultralytics_openvino()
+            except Exception:
+                self.ultralytics_model = None
+                self.ultralytics_imgsz_hw = None
+        else:
             self.ultralytics_model = None
             self.ultralytics_imgsz_hw = None
 
@@ -71,13 +123,17 @@ class OpenVINOYOLODetector:
         self.compiled_model = core.compile_model(model, self.device)
         self.input_port = self.compiled_model.input(0)
         self.output_port = self.compiled_model.output(0)
+        if self.ultralytics_model is not None and self._can_use_ultralytics_openvino():
+            self._log_runtime_selection("Ultralytics OpenVINO")
+        else:
+            self._log_runtime_selection("raw runtime")
 
     def detect(self, thermal_image: np.ndarray) -> OpenVINODetectionResult:
         """Run OpenVINO YOLOv8 detection on thermal image."""
         if self.ultralytics_model is None and self.compiled_model is None:
             raise RuntimeError("Model not loaded")
 
-        if self.ultralytics_model is not None:
+        if self.ultralytics_model is not None and self._can_use_ultralytics_openvino():
             try:
                 return self._detect_ultralytics_openvino(thermal_image)
             except Exception as exc:
@@ -243,6 +299,7 @@ class OpenVINOYOLODetector:
             confidence=confidence,
             inference_time_ms=inference_time_ms,
             max_temperature=max_temp,
+            execution_devices=tuple(self._get_execution_devices()),
         )
 
     def _detect_raw_openvino(self, thermal_image: np.ndarray) -> OpenVINODetectionResult:
@@ -336,6 +393,7 @@ class OpenVINOYOLODetector:
             confidence=confidence,
             inference_time_ms=inference_time_ms,
             max_temperature=max_temp,
+            execution_devices=tuple(self._get_execution_devices()),
         )
 
     def _prepare_thermal_input(self, thermal_image: np.ndarray) -> np.ndarray:

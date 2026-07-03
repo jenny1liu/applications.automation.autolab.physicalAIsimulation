@@ -104,6 +104,8 @@ class ThermalImageGenerator:
         hotspot_radius_range: Tuple[int, int] = (8, 20),
         shape: HotspotShape = HotspotShape.CIRCULAR,
         workload: Optional[str] = None,
+        skip_area: Optional[Tuple[int, int, int, int]] = None,
+        target_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> ThermalFrame:
         """Generate a realistic FLIR-like laptop thermal scene."""
         del hotspot_temp_range, hotspot_radius_range, shape
@@ -118,10 +120,10 @@ class ThermalImageGenerator:
         yy, xx = np.indices((self.height, self.width), dtype=np.float32)
         temp = np.full((self.height, self.width), ambient, dtype=np.float32)
 
-        # Structural laptop gradients.
+        # Structural laptop gradients (kept subtle to avoid strong vertical color split).
         top_bias = np.clip(1.0 - (yy / max(self.height - 1, 1)), 0.0, 1.0)
         center_bias = 1.0 - np.abs((xx - self.width * 0.5) / (self.width * 0.5 + 1e-6))
-        temp += 1.8 * top_bias + 0.8 * center_bias
+        temp += 0.7 * top_bias + 0.5 * center_bias
 
         cpu_cx = float(self.width * self.rng.uniform(0.34, 0.50))
         cpu_cy = float(self.height * self.rng.uniform(0.16, 0.25))
@@ -177,9 +179,9 @@ class ThermalImageGenerator:
         keyboard_gain = float(self.rng.uniform(*profile["keyboard_gain"]))
         temp += keyboard_mask * (keyboard_gain * cpu_amp * conduction + row_pattern * (cpu_amp * 0.08))
 
-        # Palm rest: generally cooler region.
+        # Palm rest: slightly cooler region, but avoid heavy bottom-only tint.
         palm_y0 = int(self.height * 0.76)
-        palm_cool = float(self.rng.uniform(1.5, 4.5))
+        palm_cool = float(self.rng.uniform(0.4, 1.4))
         temp[palm_y0:, :] -= palm_cool
 
         # Fan ring texture around cooling region.
@@ -194,6 +196,40 @@ class ThermalImageGenerator:
         if current_max > ambient + 1e-6:
             gain = (target_max - ambient) / (current_max - ambient)
             temp = ambient + (temp - ambient) * gain
+
+        skip_mask = np.zeros((self.height, self.width), dtype=bool)
+        if skip_area is not None:
+            x0, y0, x1, y1 = self._normalize_rect(skip_area)
+            skip_mask[y0:y1, x0:x1] = True
+
+        targetPoint: Optional[Tuple[int, int]] = None
+        if target_area is not None:
+            tx0, ty0, tx1, ty1 = self._normalize_rect(target_area)
+            fx = int(np.clip(round((tx0 + tx1 - 1) * 0.5), 0, self.width - 1))
+            fy = int(np.clip(round((ty0 + ty1 - 1) * 0.5), 0, self.height - 1))
+            targetPoint = (fx, fy)
+            spanX = max(3.0, float(tx1 - tx0) * 0.38)
+            spanY = max(3.0, float(ty1 - ty0) * 0.38)
+            fixed_blob = self._gaussian_2d(
+                xx,
+                yy,
+                float(fx),
+                float(fy),
+                spanX,
+                spanY,
+            )
+            desired_fixed_temp = min(95.0, max(target_max, profile["max_temp"][1]))
+            delta = max(0.0, desired_fixed_temp - float(temp[fy, fx]))
+            if delta > 0.0:
+                temp += delta * fixed_blob
+
+            # Keep whole target area hotter than surroundings with smooth floor temperature.
+            areaFloor = ambient + max(8.0, delta * 0.55)
+            temp[ty0:ty1, tx0:tx1] = np.maximum(temp[ty0:ty1, tx0:tx1], areaFloor)
+
+        if np.any(skip_mask):
+            # Keep forbidden area warm enough for realism, but below hotspot threshold.
+            temp[skip_mask] = np.minimum(temp[skip_mask], ambient + 3.0)
 
         temp = np.clip(temp, 22.0, 95.0).astype(np.float32)
 
@@ -211,7 +247,7 @@ class ThermalImageGenerator:
             ),
         }
 
-        train_mask = ((temp > (ambient + 8.0)) & (yy < self.height * 0.80)).astype(np.uint8) * 255
+        train_mask = ((temp > (ambient + 8.0)) & (yy < self.height * 0.80) & (~skip_mask)).astype(np.uint8) * 255
 
         hottest_flat_idx = int(np.argmax(temp))
         hot_y, hot_x = np.unravel_index(hottest_flat_idx, temp.shape)
@@ -220,7 +256,20 @@ class ThermalImageGenerator:
 
         thermal_rgb = self.render_flir(temp)
 
-        top_hotspots = self._extract_top_hotspots(temp, hotspot_count)
+        forcedPeak: Optional[Tuple[float, float, float]] = None
+        effectiveHotspotCount = int(hotspot_count)
+        if targetPoint is not None:
+            fx, fy = targetPoint
+            if not skip_mask[fy, fx]:
+                forcedPeak = (float(fx), float(fy), float(temp[fy, fx]))
+                effectiveHotspotCount += 1
+
+        top_hotspots = self._extract_top_hotspots(
+            temp,
+            effectiveHotspotCount,
+            forbidden_mask=skip_mask,
+            forced_peak=forcedPeak,
+        )
         hotspot_centers = [(x, y) for x, y, _ in top_hotspots]
         hotspot_temps = [t for _, _, t in top_hotspots]
 
@@ -319,27 +368,59 @@ class ThermalImageGenerator:
 
         return noisy
 
-    def _extract_top_hotspots(self, temp: np.ndarray, hotspot_count: int) -> list[Tuple[float, float, float]]:
+    def _extract_top_hotspots(
+        self,
+        temp: np.ndarray,
+        hotspot_count: int,
+        forbidden_mask: Optional[np.ndarray] = None,
+        forced_peak: Optional[Tuple[float, float, float]] = None,
+    ) -> list[Tuple[float, float, float]]:
         """Extract top-N distinct hotspot peaks using simple non-maximum suppression."""
-        count = int(np.clip(hotspot_count, 1, 5))
+        count = max(1, int(hotspot_count))
         work = temp.copy()
         peaks: list[Tuple[float, float, float]] = []
 
+        if forbidden_mask is not None and forbidden_mask.shape == work.shape:
+            work[forbidden_mask] = -1e9
+
         suppress_r = max(6, int(min(self.width, self.height) * 0.035))
 
-        for _ in range(count):
-            flat_idx = int(np.argmax(work))
-            y, x = np.unravel_index(flat_idx, work.shape)
-            t = float(work[y, x])
-            peaks.append((float(x), float(y), t))
-
+        def suppress_neighborhood(x: int, y: int) -> None:
             y0 = max(0, y - suppress_r)
             y1 = min(self.height, y + suppress_r + 1)
             x0 = max(0, x - suppress_r)
             x1 = min(self.width, x + suppress_r + 1)
             work[y0:y1, x0:x1] = -1e9
 
+        if forced_peak is not None and len(peaks) < count:
+            fx = int(np.clip(round(float(forced_peak[0])), 0, self.width - 1))
+            fy = int(np.clip(round(float(forced_peak[1])), 0, self.height - 1))
+            if work[fy, fx] > -1e8:
+                ft = float(temp[fy, fx])
+                peaks.append((float(fx), float(fy), ft))
+                suppress_neighborhood(fx, fy)
+
+        while len(peaks) < count:
+            flat_idx = int(np.argmax(work))
+            yRaw, xRaw = np.unravel_index(flat_idx, work.shape)
+            yIdx = int(yRaw)
+            xIdx = int(xRaw)
+            t = float(work[yIdx, xIdx])
+            if t <= -1e8:
+                break
+            peaks.append((float(xIdx), float(yIdx), t))
+            suppress_neighborhood(xIdx, yIdx)
+
         return peaks
+
+    def _normalize_rect(self, rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        """Clamp and normalize rectangle to image bounds, returning [x0, y0, x1, y1)."""
+        x0, y0, x1, y1 = [int(v) for v in rect]
+        left = int(np.clip(min(x0, x1), 0, self.width - 1))
+        right = int(np.clip(max(x0, x1), 0, self.width - 1))
+        top = int(np.clip(min(y0, y1), 0, self.height - 1))
+        bottom = int(np.clip(max(y0, y1), 0, self.height - 1))
+        return left, top, right + 1, bottom + 1
 
     @staticmethod
     def _gaussian_2d(
