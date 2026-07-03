@@ -1173,8 +1173,10 @@ class ThermalHotspotDemo:
     def _build_vis_and_metrics(self, parent: tk.Frame) -> None:
         self._vis_frame = tk.Frame(parent, bg=C["bg"])
         self._vis_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        self._vis_frame.columnconfigure((0, 1, 2), weight=1)
-        self._vis_frame.rowconfigure((0, 1), weight=1)
+        for col in (0, 1, 2):
+            self._vis_frame.columnconfigure(col, weight=1, uniform="viz_col")
+        for row in (0, 1):
+            self._vis_frame.rowconfigure(row, weight=1)
 
         right = tk.Frame(parent, bg=C["surface"],
                           highlightbackground=C["border"],
@@ -1225,8 +1227,12 @@ class ThermalHotspotDemo:
         card = tk.Frame(self._vis_frame, bg=C["card"],
                          highlightbackground=C["border"],
                          highlightthickness=1)
+        if row == 1 and colspan == 1:
+            pad_x = (4, 4)
+        else:
+            pad_x = (0 if col == 0 else 8, 0)
         card.grid(row=row, column=col, columnspan=colspan,
-                  padx=(0 if col == 0 else 8, 0),
+                  padx=pad_x,
                   pady=(0 if row == 0 else 8, 0),
                   sticky="nsew")
         card.columnconfigure(0, weight=1)
@@ -1253,7 +1259,7 @@ class ThermalHotspotDemo:
         ax.axis("off")
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
-        fig.tight_layout(pad=0.3)
+        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
 
         cv = FigureCanvasTkAgg(fig, master=card)
         cv.get_tk_widget().configure(bg=C["card"], highlightthickness=0)
@@ -1358,8 +1364,9 @@ class ThermalHotspotDemo:
         fig.clear()
         ax = fig.add_subplot(111)
         ax.set_facecolor("#161929")
-        if key == "thermal":
-            # Draw thermal fully, then overlay keyboard guides to avoid color-cast tinting.
+        imgH, imgW = int(image.shape[0]), int(image.shape[1])
+        if key in ("thermal", "opencv", "pytorch", "openvino"):
+            # Keep all model cards on the same geometric reference and keyboard guide.
             ax.imshow(image, cmap=cmap, aspect="auto", alpha=1.0, zorder=2)
             self._draw_keyboard_c_deck_reference(ax, image.shape)
         else:
@@ -1370,21 +1377,17 @@ class ThermalHotspotDemo:
         if result is not None:
             ax.scatter([result.center_x], [result.center_y],
                        c="#EF4444", s=55, marker="x", zorder=6, linewidths=2)
-            x, y, w, h = result.bbox
-            ax.add_patch(Rectangle((x, y), w, h, fill=False,
-                                    edgecolor="#FCD34D", linewidth=1.5))
         if key == "thermal":
             self._draw_hotspot_constraints(ax, image.shape)
 
         # Lock axes to the exact thermal pixel boundaries so overlays touch all edges.
-        imgH, imgW = int(image.shape[0]), int(image.shape[1])
         ax.set_xlim(-0.5, imgW - 0.5)
         ax.set_ylim(imgH - 0.5, -0.5)
 
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
         ax.axis("off")
-        fig.tight_layout(pad=0.3)
+        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
         cv.draw()
         self._sub_vars[key].set(subtitle)
 
@@ -1786,13 +1789,6 @@ class ThermalHotspotDemo:
         constraints: dict = {}
         deckX0, deckY0, deckX1, deckY1 = self._get_c_deck_bounds(
             self.generator.width, self.generator.height)
-        if self.skipAreaRect is not None:
-            x0, y0, x1, y1 = self.skipAreaRect
-            left = int(np.clip(min(x0, x1), deckX0, deckX1))
-            right = int(np.clip(max(x0, x1), deckX0, deckX1))
-            top = int(np.clip(min(y0, y1), deckY0, deckY1))
-            bottom = int(np.clip(max(y0, y1), deckY0, deckY1))
-            constraints["skip_area"] = (left, top, right, bottom)
         if self.targetAreaRect is not None:
             x0, y0, x1, y1 = self.targetAreaRect
             left = int(np.clip(min(x0, x1), deckX0, deckX1))
@@ -1801,6 +1797,29 @@ class ThermalHotspotDemo:
             bottom = int(np.clip(max(y0, y1), deckY0, deckY1))
             constraints["target_area"] = (left, top, right, bottom)
         return constraints
+
+    def _build_skip_area_for_detection(self) -> Optional[tuple[int, int, int, int]]:
+        if self.skipAreaRect is None:
+            return None
+        deckX0, deckY0, deckX1, deckY1 = self._get_c_deck_bounds(
+            self.generator.width, self.generator.height)
+        x0, y0, x1, y1 = self.skipAreaRect
+        left = int(np.clip(min(x0, x1), deckX0, deckX1))
+        right = int(np.clip(max(x0, x1), deckX0, deckX1))
+        top = int(np.clip(min(y0, y1), deckY0, deckY1))
+        bottom = int(np.clip(max(y0, y1), deckY0, deckY1))
+        return left, top, right, bottom
+
+    def _apply_skip_mask_for_detection(self, image: np.ndarray) -> np.ndarray:
+        skip_rect = self._build_skip_area_for_detection()
+        if skip_rect is None:
+            return image
+
+        left, top, right, bottom = skip_rect
+        masked = image.copy()
+        fill_temp = float(np.percentile(masked, 5.0))
+        masked[top:bottom + 1, left:right + 1] = fill_temp
+        return masked
 
     def _clear_card(self, key: str) -> None:
         fig = self._img_figs[key]
@@ -1813,7 +1832,7 @@ class ThermalHotspotDemo:
         ax.text(0.5, 0.5, "Single Run", ha="center", va="center",
                 color=C["dim"], fontsize=9, transform=ax.transAxes)
         ax.axis("off")
-        fig.tight_layout(pad=0.3)
+        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
         cv.draw()
         self._sub_vars[key].set("—")
 
@@ -1912,8 +1931,9 @@ class ThermalHotspotDemo:
     def _run_detections_threaded(self) -> None:
         try:
             results = {}
+            detection_image = self._apply_skip_mask_for_detection(self.current_frame.image)
             results["opencv"] = self.opencv_detector.detect(
-                self.current_frame.image)
+                detection_image)
             if self.yolo_pytorch_detector is None:
                 try:
                     self.yolo_pytorch_detector = YOLOv8PyTorchDetector(
@@ -1923,13 +1943,13 @@ class ThermalHotspotDemo:
                     print(f"PyTorch N/A: {e}")
             if self.yolo_pytorch_detector:
                 results["pytorch"] = self.yolo_pytorch_detector.detect(
-                    self.current_frame.image)
+                    detection_image)
             if self.yolo_openvino_detector is None:
                 # Ensure first detection can include OpenVINO even if async startup load is not ready yet.
                 self.load_openvino_model(show_success=False, show_errors=False)
             if self.yolo_openvino_detector:
                 results["openvino"] = self.yolo_openvino_detector.detect(
-                    self.current_frame.image)
+                    detection_image)
             self.root.after(0, lambda: self._display_results(results))
         except Exception as e:
             errorMessage = str(e)
@@ -1982,9 +2002,10 @@ class ThermalHotspotDemo:
             warm_frame = gen.generate(hotspot_count=hotspot_count,
                                        shape=HotspotShape.CIRCULAR,
                                        **constraints)
+            warm_image = self._apply_skip_mask_for_detection(warm_frame.image)
             for detector in active_detectors.values():
                 try:
-                    detector.detect(warm_frame.image)
+                    detector.detect(warm_image)
                 except Exception:
                     pass
 
@@ -1993,8 +2014,9 @@ class ThermalHotspotDemo:
                                      shape=HotspotShape.CIRCULAR,
                                      **constraints)
                 gt_x, gt_y = frame.centers[0]
+                detection_image = self._apply_skip_mask_for_detection(frame.image)
                 for key, detector in active_detectors.items():
-                    result = detector.detect(frame.image)
+                    result = detector.detect(detection_image)
                     error = MetricsCalculator.localization_error(
                         result.center_x, result.center_y, gt_x, gt_y)
                     latency = float(result.inference_time_ms)
@@ -2112,6 +2134,10 @@ class ThermalHotspotDemo:
              for r in results.values()),
             default=float("inf"),
         )
+        best_latency = min(
+            (float(r.inference_time_ms) for r in results.values()),
+            default=float("inf"),
+        )
         tagged: list[tuple[str, str]] = [
             ("header", "SINGLE RUN SUMMARY\n\n")]
         for key in ("opencv", "pytorch", "openvino"):
@@ -2142,6 +2168,7 @@ class ThermalHotspotDemo:
                 f"X {robot.X:.3f}  Y {robot.Y:.3f}  Z {robot.Z:.3f}"
             )
             is_best = abs(err - best_err) < 0.01
+            is_fastest = abs(float(r.inference_time_ms) - best_latency) < 0.01
             tagged += [
                 ("key",   f"{MODEL_DISPLAY_NAMES[key].upper()}\n"),
             ]
@@ -2154,7 +2181,7 @@ class ThermalHotspotDemo:
                 ("muted", "  Position Error:        "),
                 ("good" if is_best else "warn", f"{err:.2f} px\n"),
                 ("muted", "  Processing Time:       "),
-                ("val",   f"{r.inference_time_ms:.2f} ms\n"),
+                ("good" if is_fastest else "warn", f"{r.inference_time_ms:.2f} ms\n"),
                 ("muted", "  Frame Rate:            "),
                 ("val",   f"{fps:.0f} fps\n"),
                 ("muted", "  Detection Confidence:  "),

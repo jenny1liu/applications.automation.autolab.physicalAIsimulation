@@ -34,50 +34,57 @@ class ThermalFrame:
 
 
 class ThermalImageGenerator:
-    """Generate realistic laptop thermal scenes for synthetic data creation."""
+    """Generate realistic laptop thermal scenes for synthetic data creation.
+
+    Calibration notes (v3):
+    Tuned against a real Surface Laptop thermal reference where keyboard
+    center is hottest (~35C), top hinge band is warm, and left/right side
+    edges are visibly cooler. Surface temperatures are diffuse, so the scene
+    uses broad blobs and a global diffusion pass instead of sharp hotspots.
+    """
 
     WORKLOAD_PROFILES = {
         "light": {
-            "cpu_temp": (60.0, 72.0),
-            "gpu_temp": (50.0, 62.0),
-            "fan_temp": (42.0, 52.0),
+            "cpu_temp": (31.5, 34.5),
+            "gpu_temp": (30.0, 33.0),
+            "fan_temp": (28.5, 31.5),
             "keyboard_gain": (0.10, 0.16),
-            "max_temp": (70.0, 78.0),
+            "max_temp": (33.0, 36.0),
         },
         "medium": {
-            "cpu_temp": (68.0, 82.0),
-            "gpu_temp": (56.0, 72.0),
-            "fan_temp": (46.0, 60.0),
+            "cpu_temp": (33.5, 37.5),
+            "gpu_temp": (31.0, 35.0),
+            "fan_temp": (29.0, 33.0),
             "keyboard_gain": (0.14, 0.22),
-            "max_temp": (76.0, 86.0),
+            "max_temp": (35.0, 39.0),
         },
         "heavy": {
-            "cpu_temp": (78.0, 92.0),
-            "gpu_temp": (66.0, 84.0),
-            "fan_temp": (52.0, 68.0),
+            "cpu_temp": (36.0, 41.0),
+            "gpu_temp": (33.0, 38.0),
+            "fan_temp": (30.0, 35.0),
             "keyboard_gain": (0.20, 0.30),
-            "max_temp": (84.0, 95.0),
+            "max_temp": (38.0, 43.0),
         },
         "cpu_stress": {
-            "cpu_temp": (84.0, 95.0),
-            "gpu_temp": (50.0, 64.0),
-            "fan_temp": (54.0, 72.0),
+            "cpu_temp": (38.0, 44.0),
+            "gpu_temp": (31.0, 36.0),
+            "fan_temp": (31.0, 36.0),
             "keyboard_gain": (0.18, 0.28),
-            "max_temp": (88.0, 95.0),
+            "max_temp": (40.0, 46.0),
         },
         "gpu_stress": {
-            "cpu_temp": (64.0, 78.0),
-            "gpu_temp": (76.0, 92.0),
-            "fan_temp": (50.0, 70.0),
+            "cpu_temp": (32.0, 38.0),
+            "gpu_temp": (37.0, 43.0),
+            "fan_temp": (31.0, 36.0),
             "keyboard_gain": (0.17, 0.27),
-            "max_temp": (84.0, 95.0),
+            "max_temp": (40.0, 46.0),
         },
         "dual_stress": {
-            "cpu_temp": (84.0, 95.0),
-            "gpu_temp": (78.0, 92.0),
-            "fan_temp": (58.0, 75.0),
+            "cpu_temp": (39.0, 46.0),
+            "gpu_temp": (37.0, 44.0),
+            "fan_temp": (32.0, 38.0),
             "keyboard_gain": (0.22, 0.34),
-            "max_temp": (90.0, 95.0),
+            "max_temp": (43.0, 50.0),
         },
     }
 
@@ -85,7 +92,7 @@ class ThermalImageGenerator:
         self,
         width: int = 320,
         height: int = 240,
-        background_temp: float = 30.0,
+        background_temp: float = 28.0,
         noise_std: float = 1.0,
         seed: Optional[int] = None,
     ):
@@ -115,22 +122,57 @@ class ThermalImageGenerator:
             raise ValueError(f"Unknown workload '{scene_workload}'")
 
         profile = self.WORKLOAD_PROFILES[scene_workload]
-        ambient = float(np.clip(self.background_temp + self.rng.uniform(-2.5, 0.8), 22.0, 30.0))
+        ambient = float(np.clip(self.background_temp + self.rng.uniform(-1.8, 0.6), 24.0, 32.0))
 
         yy, xx = np.indices((self.height, self.width), dtype=np.float32)
         temp = np.full((self.height, self.width), ambient, dtype=np.float32)
 
-        # Structural laptop gradients (kept subtle to avoid strong vertical color split).
+        # Global base: keyboard deck warmer than side walls and palm corners.
         top_bias = np.clip(1.0 - (yy / max(self.height - 1, 1)), 0.0, 1.0)
         center_bias = 1.0 - np.abs((xx - self.width * 0.5) / (self.width * 0.5 + 1e-6))
-        temp += 0.7 * top_bias + 0.5 * center_bias
+        edge_x = np.abs((xx - self.width * 0.5) / (self.width * 0.5 + 1e-6))
+        side_cooling = np.clip((edge_x - 0.62) / 0.38, 0.0, 1.0)
+        temp += 1.0 * top_bias + 0.9 * center_bias - 1.6 * side_cooling
 
-        cpu_cx = float(self.width * self.rng.uniform(0.34, 0.50))
-        cpu_cy = float(self.height * self.rng.uniform(0.16, 0.25))
-        gpu_cx = float(np.clip(cpu_cx + self.width * self.rng.uniform(0.10, 0.18), 0, self.width - 1))
-        gpu_cy = float(np.clip(cpu_cy + self.height * self.rng.uniform(-0.03, 0.05), 0, self.height - 1))
-        fan_cx = float(self.width * self.rng.uniform(0.72, 0.86))
-        fan_cy = float(self.height * self.rng.uniform(0.14, 0.25))
+        # Randomize layout family to avoid a single concentrated hotspot shape.
+        # Bias toward split_keyboard for broader multi-peak distributions.
+        layout_mode = str(
+            self.rng.choice(
+                ["keyboard_center", "top_vent_band", "split_keyboard"],
+                p=[0.18, 0.36, 0.46],
+            )
+        )
+        if layout_mode == "top_vent_band":
+            cpu_cx = float(self.width * self.rng.uniform(0.44, 0.56))
+            cpu_cy = float(self.height * self.rng.uniform(0.18, 0.25))
+            gpu_cx = float(np.clip(cpu_cx + self.width * self.rng.uniform(-0.10, 0.10), 0, self.width - 1))
+            gpu_cy = float(np.clip(cpu_cy + self.height * self.rng.uniform(-0.03, 0.04), 0, self.height - 1))
+            fan_cx = float(self.width * self.rng.uniform(0.60, 0.78))
+            fan_cy = float(self.height * self.rng.uniform(0.14, 0.22))
+            cpu_sigma_x, cpu_sigma_y = self.width * 0.25, self.height * 0.10
+            gpu_sigma_x, gpu_sigma_y = self.width * 0.22, self.height * 0.10
+            fan_sigma_x, fan_sigma_y = self.width * 0.36, self.height * 0.08
+        elif layout_mode == "split_keyboard":
+            cpu_cx = float(self.width * self.rng.uniform(0.35, 0.46))
+            cpu_cy = float(self.height * self.rng.uniform(0.42, 0.54))
+            gpu_cx = float(self.width * self.rng.uniform(0.56, 0.68))
+            gpu_cy = float(self.height * self.rng.uniform(0.40, 0.54))
+            fan_cx = float(self.width * self.rng.uniform(0.48, 0.58))
+            fan_cy = float(self.height * self.rng.uniform(0.16, 0.24))
+            cpu_sigma_x, cpu_sigma_y = self.width * 0.20, self.height * 0.13
+            gpu_sigma_x, gpu_sigma_y = self.width * 0.20, self.height * 0.13
+            fan_sigma_x, fan_sigma_y = self.width * 0.29, self.height * 0.09
+        else:
+            # keyboard_center
+            cpu_cx = float(self.width * self.rng.uniform(0.48, 0.57))
+            cpu_cy = float(self.height * self.rng.uniform(0.44, 0.54))
+            gpu_cx = float(np.clip(cpu_cx - self.width * self.rng.uniform(0.12, 0.22), 0, self.width - 1))
+            gpu_cy = float(np.clip(cpu_cy + self.height * self.rng.uniform(-0.04, 0.05), 0, self.height - 1))
+            fan_cx = float(self.width * self.rng.uniform(0.48, 0.58))
+            fan_cy = float(self.height * self.rng.uniform(0.16, 0.24))
+            cpu_sigma_x, cpu_sigma_y = self.width * 0.22, self.height * 0.12
+            gpu_sigma_x, gpu_sigma_y = self.width * 0.18, self.height * 0.12
+            fan_sigma_x, fan_sigma_y = self.width * 0.34, self.height * 0.08
 
         cpu_peak = float(self.rng.uniform(*profile["cpu_temp"]))
         gpu_peak = float(min(cpu_peak - self.rng.uniform(1.5, 7.0), self.rng.uniform(*profile["gpu_temp"])))
@@ -140,11 +182,11 @@ class ThermalImageGenerator:
         gpu_amp = max(gpu_peak - ambient, 1.0)
         fan_amp = max(fan_peak - ambient, 0.5)
 
-        cpu_blob = self._gaussian_2d(xx, yy, cpu_cx, cpu_cy, self.width * 0.055, self.height * 0.060)
-        gpu_blob = self._gaussian_2d(xx, yy, gpu_cx, gpu_cy, self.width * 0.060, self.height * 0.064)
-        fan_blob = self._gaussian_2d(xx, yy, fan_cx, fan_cy, self.width * 0.038, self.height * 0.050)
+        cpu_blob = self._gaussian_2d(xx, yy, cpu_cx, cpu_cy, cpu_sigma_x, cpu_sigma_y)
+        gpu_blob = self._gaussian_2d(xx, yy, gpu_cx, gpu_cy, gpu_sigma_x, gpu_sigma_y)
+        fan_blob = self._gaussian_2d(xx, yy, fan_cx, fan_cy, fan_sigma_x, fan_sigma_y)
 
-        # Heatpipe effect: elongated horizontal spread from CPU/GPU toward fan.
+        # Heatpipe effect: shallow warm strip between top band and keyboard.
         pipe_cx = float((cpu_cx + fan_cx) * 0.5)
         pipe_cy = float((cpu_cy + fan_cy) * 0.5 + self.height * self.rng.uniform(-0.01, 0.01))
         heatpipe_blob = self._gaussian_2d(
@@ -152,42 +194,113 @@ class ThermalImageGenerator:
             yy,
             pipe_cx,
             pipe_cy,
-            self.width * 0.17,
-            self.height * 0.022,
+            self.width * 0.30,
+            self.height * 0.065,
         )
 
-        temp += cpu_amp * cpu_blob
-        temp += gpu_amp * gpu_blob
-        temp += fan_amp * fan_blob
-        temp += (0.28 * cpu_amp + 0.18 * gpu_amp) * heatpipe_blob
+        # Warm strip above F1-F12 region and a broader keyboard blanket.
+        top_strip = self._gaussian_2d(
+            xx,
+            yy,
+            self.width * self.rng.uniform(0.50, 0.58),
+            self.height * self.rng.uniform(0.20, 0.27),
+            self.width * 0.42,
+            self.height * 0.085,
+        )
+        keyboard_blanket = self._gaussian_2d(
+            xx,
+            yy,
+            self.width * 0.50,
+            self.height * 0.50,
+            self.width * 0.40,
+            self.height * 0.28,
+        )
+
+        side_left = self._gaussian_2d(
+            xx,
+            yy,
+            self.width * self.rng.uniform(0.02, 0.07),
+            self.height * self.rng.uniform(0.74, 0.86),
+            self.width * 0.06,
+            self.height * 0.07,
+        )
+        side_right = self._gaussian_2d(
+            xx,
+            yy,
+            self.width * self.rng.uniform(0.93, 0.98),
+            self.height * self.rng.uniform(0.74, 0.86),
+            self.width * 0.06,
+            self.height * 0.07,
+        )
+
+        temp += 0.72 * cpu_amp * cpu_blob
+        temp += 0.64 * gpu_amp * gpu_blob
+        temp += 0.50 * fan_amp * fan_blob
+        temp += (0.24 * cpu_amp + 0.20 * gpu_amp) * heatpipe_blob
+        temp += (0.30 * fan_amp + 0.18 * cpu_amp) * (side_left + side_right)
+        temp += (0.24 * cpu_amp + 0.14 * fan_amp) * top_strip
+        temp += 0.26 * cpu_amp * keyboard_blanket
+
+        # Add a few diffuse local sources so hotspots are distributed instead
+        # of collapsing to one dominant point.
+        for _ in range(int(self.rng.integers(4, 7))):
+            local_blob = self._gaussian_2d(
+                xx,
+                yy,
+                self.width * float(self.rng.uniform(0.28, 0.72)),
+                self.height * float(self.rng.uniform(0.26, 0.78)),
+                self.width * float(self.rng.uniform(0.08, 0.16)),
+                self.height * float(self.rng.uniform(0.07, 0.14)),
+            )
+            local_weight = float(self.rng.uniform(0.05, 0.11))
+            temp += local_weight * (0.7 * cpu_amp + 0.3 * gpu_amp) * local_blob
+
+        # Add low-amplitude warm patches around lower keyboard/palm transition
+        # to prevent the map from collapsing into only top-band peaks.
+        for _ in range(int(self.rng.integers(2, 4))):
+            lower_blob = self._gaussian_2d(
+                xx,
+                yy,
+                self.width * float(self.rng.uniform(0.30, 0.70)),
+                self.height * float(self.rng.uniform(0.62, 0.82)),
+                self.width * float(self.rng.uniform(0.12, 0.22)),
+                self.height * float(self.rng.uniform(0.09, 0.16)),
+            )
+            lower_weight = float(self.rng.uniform(0.04, 0.10))
+            temp += lower_weight * (0.6 * cpu_amp + 0.4 * fan_amp) * lower_blob
 
         # Keyboard conduction with smooth diffusion and gradients.
-        source_energy = np.clip(cpu_blob + gpu_blob + 0.9 * heatpipe_blob, 0.0, 2.5).astype(np.float32)
-        conduction = cv2.GaussianBlur(source_energy, (0, 0), sigmaX=self.width * 0.09, sigmaY=self.height * 0.07)
+        source_energy = np.clip(
+            cpu_blob + gpu_blob + 1.0 * heatpipe_blob + 0.9 * top_strip + 0.8 * keyboard_blanket,
+            0.0,
+            3.2,
+        ).astype(np.float32)
+        conduction = cv2.GaussianBlur(source_energy, (0, 0), sigmaX=self.width * 0.13, sigmaY=self.height * 0.25)
         conduction /= np.max(conduction) + 1e-6
 
         keyboard_mask = np.zeros((self.height, self.width), dtype=np.float32)
         key_x0 = int(self.width * 0.12)
         key_x1 = int(self.width * 0.88)
-        key_y0 = int(self.height * 0.43)
+        key_y0 = int(self.height * 0.24)
         key_y1 = int(self.height * 0.75)
         keyboard_mask[key_y0:key_y1, key_x0:key_x1] = 1.0
 
-        # Slight key-row pattern to mimic real laptop thermal texture.
-        row_pattern = np.sin(np.linspace(0, np.pi * 10, self.height, dtype=np.float32))[:, None]
-        row_pattern = 0.06 * (row_pattern + 1.0)
+        # Faint key-row texture; kept subtle since real IR footage shows a
+        # smooth gradient across the keyboard, not a visible row pattern.
+        row_pattern = np.sin(np.linspace(0, np.pi * 8, self.height, dtype=np.float32))[:, None]
+        row_pattern = 0.02 * (row_pattern + 1.0)
         keyboard_gain = float(self.rng.uniform(*profile["keyboard_gain"]))
-        temp += keyboard_mask * (keyboard_gain * cpu_amp * conduction + row_pattern * (cpu_amp * 0.08))
+        temp += keyboard_mask * (keyboard_gain * cpu_amp * conduction + row_pattern * (cpu_amp * 0.02))
 
         # Palm rest: slightly cooler region, but avoid heavy bottom-only tint.
         palm_y0 = int(self.height * 0.76)
-        palm_cool = float(self.rng.uniform(0.4, 1.4))
+        palm_cool = float(self.rng.uniform(0.8, 2.1))
         temp[palm_y0:, :] -= palm_cool
 
-        # Fan ring texture around cooling region.
-        fan_dist = np.sqrt((xx - fan_cx) ** 2 + (yy - fan_cy) ** 2)
-        ring = np.exp(-((fan_dist - self.width * 0.03) ** 2) / (2.0 * (self.width * 0.013) ** 2))
-        temp += ring.astype(np.float32) * fan_amp * 0.12
+        # Overall thermal diffusion blur: real chassis surfaces spread heat
+        # smoothly, so sharpen-free blending here avoids the hard synthetic
+        # edges a raw sum of Gaussians otherwise produces.
+        temp = cv2.GaussianBlur(temp, (0, 0), sigmaX=self.width * 0.028, sigmaY=self.height * 0.028)
 
         temp = self._add_sensor_noise(temp, ambient)
 
@@ -195,6 +308,7 @@ class ThermalImageGenerator:
         current_max = float(np.max(temp))
         if current_max > ambient + 1e-6:
             gain = (target_max - ambient) / (current_max - ambient)
+            gain = min(gain, 1.35)
             temp = ambient + (temp - ambient) * gain
 
         skip_mask = np.zeros((self.height, self.width), dtype=bool)
@@ -247,7 +361,8 @@ class ThermalImageGenerator:
             ),
         }
 
-        train_mask = ((temp > (ambient + 8.0)) & (yy < self.height * 0.80) & (~skip_mask)).astype(np.uint8) * 255
+        # Keep threshold tied to ambient so masks remain stable after profile tuning.
+        train_mask = ((temp > (ambient + 3.2)) & (yy < self.height * 0.80) & (~skip_mask)).astype(np.uint8) * 255
 
         hottest_flat_idx = int(np.argmax(temp))
         hot_y, hot_x = np.unravel_index(hottest_flat_idx, temp.shape)
@@ -383,7 +498,7 @@ class ThermalImageGenerator:
         if forbidden_mask is not None and forbidden_mask.shape == work.shape:
             work[forbidden_mask] = -1e9
 
-        suppress_r = max(6, int(min(self.width, self.height) * 0.035))
+        suppress_r = max(8, int(min(self.width, self.height) * 0.070))
 
         def suppress_neighborhood(x: int, y: int) -> None:
             y0 = max(0, y - suppress_r)
