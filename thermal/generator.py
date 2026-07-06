@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from thermal_dataset_generator.config import GeneratorConfig as DatasetGeneratorConfig
+from thermal_dataset_generator.generator import ThermalDatasetGenerator
 
 
 class HotspotShape(Enum):
@@ -30,7 +34,13 @@ class ThermalFrame:
     # Highest temperature pixel as global hotspot ground truth.
     hotspot_coordinate: Optional[Tuple[float, float]] = None
     hotspot_temperature: Optional[float] = None
+    hottest_region_category: str = "genuine_source"
+    excluded_hottest_region: Optional[str] = None
+    target_source_attribution_fraction: Optional[float] = None
     workload: str = "medium"
+    power_class: str = "unknown"
+    keyboard_plateau_coverage: float = 0.0
+    dgpu_enabled: bool = False
 
 
 class ThermalImageGenerator:
@@ -369,7 +379,9 @@ class ThermalImageGenerator:
         hotspot_coordinate = (float(hot_x), float(hot_y))
         hotspot_temperature = float(temp[hot_y, hot_x])
 
-        thermal_rgb = self.render_flir(temp)
+        display_low = float(max(20.0, ambient - 2.5))
+        display_high = float(max(display_low + 8.0, target_max + 1.5))
+        thermal_rgb = self.render_flir(temp, temp_range=(display_low, display_high))
 
         forcedPeak: Optional[Tuple[float, float, float]] = None
         effectiveHotspotCount = int(hotspot_count)
@@ -421,10 +433,18 @@ class ThermalImageGenerator:
             frames.append(self.generate(workload=selected))
         return frames
 
-    def render_flir(self, temperature_matrix: np.ndarray) -> np.ndarray:
+    def render_flir(
+        self,
+        temperature_matrix: np.ndarray,
+        temp_range: Optional[Tuple[float, float]] = None,
+    ) -> np.ndarray:
         """Render a FLIR-like RGB thermal image from raw temperature matrix."""
-        low = float(np.percentile(temperature_matrix, 2.0))
-        high = float(np.percentile(temperature_matrix, 99.2))
+        if temp_range is None:
+            low = float(np.min(temperature_matrix))
+            high = float(np.max(temperature_matrix))
+        else:
+            low = float(temp_range[0])
+            high = float(temp_range[1])
         if high <= low:
             high = low + 1e-3
 
@@ -555,3 +575,344 @@ class ThermalImageGenerator:
     def set_seed(self, seed: int) -> None:
         """Reset RNG seed for reproducibility."""
         self.rng = np.random.default_rng(seed)
+
+
+class DatasetBackedThermalGenerator:
+    """Adapter that exposes dataset generator samples as ThermalFrame."""
+
+    def __init__(
+        self,
+        width: int = 320,
+        height: int = 240,
+        background_temp: float = 28.0,
+        noise_std: float = 1.0,
+        seed: Optional[int] = None,
+        physics_score_threshold: float = 0.72,
+        strict_max_attempts: int = 20,
+    ):
+        self.width = width
+        self.height = height
+        self.background_temp = background_temp
+        self.noise_std = noise_std
+        self.rng = np.random.default_rng(seed)
+        self.physics_score_threshold = float(np.clip(physics_score_threshold, 0.0, 1.0))
+        self.strict_max_attempts = max(1, int(strict_max_attempts))
+
+        base_size = self._select_base_size(max(width, height))
+        self._dataset_generator = ThermalDatasetGenerator(
+            DatasetGeneratorConfig(
+                image_size=base_size,
+                dataset_size=1,
+                output_dir=Path("thermal_dataset_generator") / "output",
+                random_seed=int(seed if seed is not None else 42),
+                workers=0,
+                debug_mode=False,
+                save_mask=False,
+                save_temperature=False,
+                save_json=False,
+                noise_level=max(0.2, float(noise_std) * 0.55),
+                enable_physics_gate=True,
+                physics_score_threshold=self.physics_score_threshold,
+                physics_max_attempts=max(8, self.strict_max_attempts),
+            )
+        )
+        cfg = self._dataset_generator.config
+        self._default_power_class_weights = tuple(cfg.power_class_weights)
+        self._default_enable_gpu = bool(cfg.enable_gpu)
+        self._default_gpu_probs = (
+            float(cfg.thin_gpu_probability),
+            float(cfg.mainstream_gpu_probability),
+            float(cfg.gaming_gpu_probability),
+        )
+        self.power_class_override: Optional[str] = None
+        self.force_gpu_mode: str = "auto"
+
+    def set_runtime_controls(
+        self,
+        *,
+        noise_std: Optional[float] = None,
+        physics_threshold: Optional[float] = None,
+        power_class: Optional[str] = None,
+        force_gpu_mode: Optional[str] = None,
+    ) -> None:
+        """Update runtime semantic controls used by dataset-backed generation."""
+        if noise_std is not None:
+            self.noise_std = float(max(0.0, noise_std))
+        if physics_threshold is not None:
+            self.physics_score_threshold = float(np.clip(physics_threshold, 0.0, 1.0))
+        if power_class is not None:
+            normalized = str(power_class).strip().lower()
+            self.power_class_override = normalized if normalized in {"thin", "mainstream", "gaming"} else None
+        if force_gpu_mode is not None:
+            normalized_gpu = str(force_gpu_mode).strip().lower()
+            self.force_gpu_mode = normalized_gpu if normalized_gpu in {"auto", "on", "off"} else "auto"
+
+    def generate(
+        self,
+        hotspot_count: int = 1,
+        hotspot_temp_range: Tuple[float, float] = (80.0, 100.0),
+        hotspot_radius_range: Tuple[int, int] = (8, 20),
+        shape: HotspotShape = HotspotShape.CIRCULAR,
+        workload: Optional[str] = None,
+        skip_area: Optional[Tuple[int, int, int, int]] = None,
+        target_area: Optional[Tuple[int, int, int, int]] = None,
+    ) -> ThermalFrame:
+        """Generate frame using the synthetic dataset pipeline for UI and benchmarking."""
+        del hotspot_temp_range, hotspot_radius_range, shape
+        del hotspot_count, workload
+
+        sample = self._generate_threshold_passed_sample()
+
+        temp = sample.matrix.astype(np.float32)
+        cpu_mask = sample.cpu_mask.astype(np.uint8)
+        thermal_rgb = sample.rgb.astype(np.uint8)
+        source_h, source_w = temp.shape
+
+        if target_area is not None:
+            tx0, ty0, tx1, ty1 = self._normalize_rect(target_area)
+            temp[ty0:ty1, tx0:tx1] = np.maximum(temp[ty0:ty1, tx0:tx1], float(np.max(temp)) + 2.0)
+            cpu_mask[ty0:ty1, tx0:tx1] = 255
+
+        if skip_area is not None:
+            sx0, sy0, sx1, sy1 = self._normalize_rect(skip_area)
+            temp[sy0:sy1, sx0:sx1] = np.minimum(temp[sy0:sy1, sx0:sx1], self.background_temp + 2.5)
+            cpu_mask[sy0:sy1, sx0:sx1] = 0
+
+        if temp.shape != (self.height, self.width):
+            temp = cv2.resize(temp, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            cpu_mask = cv2.resize(cpu_mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+            thermal_rgb = cv2.resize(thermal_rgb, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+
+        region_masks: dict[str, np.ndarray] = {"cpu": cpu_mask.astype(np.uint8)}
+        for name, mask in sample.component_masks.items():
+            mask_u8 = mask.astype(np.uint8)
+            if mask_u8.shape != (self.height, self.width):
+                mask_u8 = cv2.resize(mask_u8, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+            region_masks[name] = mask_u8
+
+        keyboard_mask = region_masks.get("keyboard_area")
+        if keyboard_mask is None or not np.any(keyboard_mask > 0):
+            keyboard_mask = region_masks.get("keyboard")
+
+        if keyboard_mask is not None and np.any(keyboard_mask > 0):
+            keyboard_bool = keyboard_mask > 0
+            selection_mask_bool = keyboard_bool.copy()
+
+            # Build a small keyboard-edge exclusion band (left/right + top),
+            # because those borders often behave like vent-adjacent structure.
+            edge_exclusion = np.zeros_like(selection_mask_bool, dtype=bool)
+            ys, xs = np.where(keyboard_bool)
+            if xs.size > 0 and ys.size > 0:
+                kx0, kx1 = int(np.min(xs)), int(np.max(xs))
+                ky0, ky1 = int(np.min(ys)), int(np.max(ys))
+                k_w = max(1, kx1 - kx0 + 1)
+                k_h = max(1, ky1 - ky0 + 1)
+                side_band = max(2, int(round(k_w * 0.08)))
+                top_band = max(2, int(round(k_h * 0.10)))
+
+                edge_exclusion[ky0:ky1 + 1, kx0:min(kx1 + 1, kx0 + side_band)] = True
+                edge_exclusion[ky0:ky1 + 1, max(kx0, kx1 - side_band + 1):kx1 + 1] = True
+                edge_exclusion[ky0:min(ky1 + 1, ky0 + top_band), kx0:kx1 + 1] = True
+
+            selection_mask_bool &= ~edge_exclusion
+
+            # Exclude structural cooling regions from keyboard hotspot GT.
+            vent_mask = region_masks.get("vent")
+            if vent_mask is not None and np.any(vent_mask > 0):
+                vent_bool = vent_mask > 0
+                vent_bool = cv2.dilate(vent_bool.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
+                selection_mask_bool &= ~vent_bool
+
+            hinge_mask = region_masks.get("hinge")
+            if hinge_mask is not None and np.any(hinge_mask > 0):
+                hinge_bool = hinge_mask > 0
+                hinge_bool = cv2.dilate(hinge_bool.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
+                selection_mask_bool &= ~hinge_bool
+
+            if not np.any(selection_mask_bool):
+                selection_mask_bool = keyboard_bool.copy()
+
+                if vent_mask is not None and np.any(vent_mask > 0):
+                    vent_bool = vent_mask > 0
+                    vent_bool = cv2.dilate(vent_bool.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
+                    selection_mask_bool &= ~vent_bool
+                if hinge_mask is not None and np.any(hinge_mask > 0):
+                    hinge_bool = hinge_mask > 0
+                    hinge_bool = cv2.dilate(hinge_bool.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
+                    selection_mask_bool &= ~hinge_bool
+
+            if not np.any(selection_mask_bool):
+                selection_mask_bool = keyboard_bool
+
+            hot_y, hot_x = self._argmax_with_mask(temp, selection_mask_bool.astype(np.uint8))
+        elif target_area is not None:
+            # Keep user-directed target-area behavior as fallback when keyboard mask is unavailable.
+            hot_y, hot_x = self._argmax_with_mask(temp, cpu_mask)
+        else:
+            hot_y, hot_x = self._argmax_with_mask(temp, cpu_mask)
+        hotspot_temp = float(temp[hot_y, hot_x])
+        cpu_center = self._mask_center(cpu_mask)
+        gpu_enabled = bool(sample.metadata.get("gpu_enabled", False))
+        gpu_center = sample.metadata.get("gpu_center", [-1.0, -1.0])
+
+        centers = [cpu_center]
+        temperatures = [float(sample.metadata.get("cpu_temperature", hotspot_temp))]
+        if gpu_enabled:
+            centers.append((float(gpu_center[0]), float(gpu_center[1])))
+            temperatures.append(float(sample.metadata.get("gpu_temperature", hotspot_temp - 4.0)))
+
+        workload_name = "post_stress"
+
+        return ThermalFrame(
+            image=temp.astype(np.float32),
+            mask=(cpu_mask > 0).astype(np.uint8) * 255,
+            centers=centers,
+            temperatures=temperatures,
+            width=self.width,
+            height=self.height,
+            thermal_image=thermal_rgb.astype(np.uint8),
+            region_masks=region_masks,
+            hotspot_coordinate=(float(hot_x), float(hot_y)),
+            hotspot_temperature=hotspot_temp,
+            hottest_region_category=str(sample.metadata.get("hottest_region_category", "genuine_source")),
+            excluded_hottest_region=sample.metadata.get("excluded_hottest_region"),
+            target_source_attribution_fraction=float(sample.metadata.get("target_source_attribution_fraction"))
+            if sample.metadata.get("target_source_attribution_fraction") is not None
+            else None,
+            workload=workload_name,
+            power_class=str(sample.metadata.get("power_class", "unknown")),
+            keyboard_plateau_coverage=float(
+                sample.metadata.get(
+                    "keyboard_plateau_effective_coverage",
+                    sample.metadata.get("keyboard_plateau_coverage", 0.0),
+                )
+            ),
+            dgpu_enabled=bool(gpu_enabled),
+        )
+
+    def _generate_threshold_passed_sample(self):
+        """Generate samples until physics score passes the configured threshold."""
+        cfg = self._dataset_generator.config
+        cfg.noise_level = max(0.2, float(self.noise_std) * 0.55)
+        cfg.physics_score_threshold = float(self.physics_score_threshold)
+        cfg.physics_max_attempts = max(8, int(self.strict_max_attempts))
+
+        if self.power_class_override == "thin":
+            cfg.power_class_weights = (1.0, 0.0, 0.0)
+        elif self.power_class_override == "mainstream":
+            cfg.power_class_weights = (0.0, 1.0, 0.0)
+        elif self.power_class_override == "gaming":
+            cfg.power_class_weights = (0.0, 0.0, 1.0)
+        else:
+            cfg.power_class_weights = tuple(self._default_power_class_weights)
+
+        if self.force_gpu_mode == "off":
+            cfg.enable_gpu = False
+            cfg.thin_gpu_probability = 0.0
+            cfg.mainstream_gpu_probability = 0.0
+            cfg.gaming_gpu_probability = 0.0
+            if self.power_class_override is None:
+                cfg.power_class_weights = (0.70, 0.30, 0.0)
+        elif self.force_gpu_mode == "on":
+            cfg.enable_gpu = True
+            cfg.thin_gpu_probability = 1.0
+            cfg.mainstream_gpu_probability = 1.0
+            cfg.gaming_gpu_probability = 1.0
+            if self.power_class_override is None:
+                cfg.power_class_weights = (0.0, 0.35, 0.65)
+            cfg.gpu_temp_range = (34.0, 60.0)
+        else:
+            cfg.enable_gpu = bool(self._default_enable_gpu)
+            cfg.thin_gpu_probability = float(self._default_gpu_probs[0])
+            cfg.mainstream_gpu_probability = float(self._default_gpu_probs[1])
+            cfg.gaming_gpu_probability = float(self._default_gpu_probs[2])
+            cfg.gpu_temp_range = (30.0, 60.0)
+
+        best_score = -1.0
+
+        for _ in range(self.strict_max_attempts):
+            sample_idx = int(self.rng.integers(1, 1_000_000))
+            candidate = self._dataset_generator.generate_sample(index=sample_idx, seed_offset=sample_idx)
+            score = float(candidate.metadata.get("physics_score", 0.0))
+            passed = bool(candidate.metadata.get("physics_gate_passed", score >= self.physics_score_threshold))
+
+            if score > best_score:
+                best_score = score
+
+            if passed and score >= self.physics_score_threshold:
+                return candidate
+
+        raise RuntimeError(
+            f"Unable to generate frame with physics_score >= {self.physics_score_threshold:.3f} "
+            f"within {self.strict_max_attempts} attempts. Best score: {best_score:.3f}"
+        )
+
+    def generate_batch(
+        self,
+        sample_count: int,
+        workloads: Optional[Iterable[str]] = None,
+    ) -> list[ThermalFrame]:
+        """Generate a batch of ThermalFrame values using dataset backend."""
+        if sample_count <= 0:
+            return []
+        workload_list = list(workloads) if workloads else [None]
+        frames: list[ThermalFrame] = []
+        for _ in range(sample_count):
+            selected_workload = str(self.rng.choice(workload_list)) if workloads else None
+            frames.append(self.generate(workload=selected_workload))
+        return frames
+
+    def set_seed(self, seed: int) -> None:
+        """Reset random seed for adapter generation."""
+        self.rng = np.random.default_rng(seed)
+
+    @staticmethod
+    def _select_base_size(size: int) -> int:
+        """Select closest supported square dataset size for backend generation."""
+        candidates = np.array([320, 640, 1024], dtype=np.int32)
+        idx = int(np.argmin(np.abs(candidates - int(size))))
+        return int(candidates[idx])
+
+    @staticmethod
+    def _mask_center(mask: np.ndarray) -> Tuple[float, float]:
+        """Compute centroid of non-zero mask pixels."""
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            h, w = mask.shape
+            return float(w) * 0.5, float(h) * 0.5
+        return float(np.mean(xs)), float(np.mean(ys))
+
+    @staticmethod
+    def _argmax_with_mask(temp: np.ndarray, mask: Optional[np.ndarray]) -> tuple[int, int]:
+        """Return hottest point (y, x), preferring points inside mask when available."""
+        if mask is not None:
+            valid = mask > 0
+            if np.any(valid):
+                masked = np.where(valid, temp, -np.inf)
+                idx = int(np.argmax(masked))
+                y, x = np.unravel_index(idx, temp.shape)
+                if np.isfinite(float(masked[y, x])):
+                    return int(y), int(x)
+        y, x = np.unravel_index(int(np.argmax(temp)), temp.shape)
+        return int(y), int(x)
+
+    def _normalize_rect(self, rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        """Clamp and normalize rectangle to image bounds, returning [x0, y0, x1, y1)."""
+        x0, y0, x1, y1 = [int(v) for v in rect]
+        left = int(np.clip(min(x0, x1), 0, self.width - 1))
+        right = int(np.clip(max(x0, x1), 0, self.width - 1))
+        top = int(np.clip(min(y0, y1), 0, self.height - 1))
+        bottom = int(np.clip(max(y0, y1), 0, self.height - 1))
+        return left, top, right + 1, bottom + 1
+
+    @staticmethod
+    def _workload_from_hotspot_count(hotspot_count: int) -> str:
+        """Map legacy hotspot count slider values into workload labels."""
+        map_by_count = {
+            1: "light",
+            2: "medium",
+            3: "heavy",
+            4: "cpu_stress",
+            5: "dual_stress",
+        }
+        return map_by_count.get(int(np.clip(hotspot_count, 1, 5)), "medium")

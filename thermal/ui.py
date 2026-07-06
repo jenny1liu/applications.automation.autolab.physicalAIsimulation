@@ -10,6 +10,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
@@ -18,7 +19,7 @@ from thermal.metrics import MetricsCalculator
 from thermal.detectors.opencv_detector import OpenCVHotspotDetector
 from thermal.detectors.openvino_detector import OpenVINOYOLODetector
 from thermal.mapper import RobotTargetMapper
-from thermal.generator import HotspotShape, ThermalImageGenerator
+from thermal.generator import DatasetBackedThermalGenerator, HotspotShape
 from thermal.detectors.yolo_detector import YOLOv8PyTorchDetector
 
 # ── Design tokens ─────────────────────────────────────────────────────────────
@@ -64,12 +65,14 @@ class SidebarSlider(tk.Frame):
                  default: float,
                  resolution: float = 1.0,
                  integer: bool = False,
+                 decimals: int = 1,
                  width: int = 96):
         super().__init__(parent, bg=str(parent.cget("bg")))
         self._min = float(from_)
         self._max = float(to)
         self._resolution = float(resolution)
         self._integer = integer
+        self._decimals = max(0, int(decimals))
         self._trackWidth = width
         self._knobRadius = 8
         self._value = float(default)
@@ -128,7 +131,7 @@ class SidebarSlider(tk.Frame):
         if self._integer:
             self._valueVar.set(f"{int(round(self._value))}")
         else:
-            self._valueVar.set(f"{self._value:.1f}")
+            self._valueVar.set(f"{self._value:.{self._decimals}f}")
 
     def _on_press(self, event) -> None:
         self._dragging = True
@@ -358,7 +361,7 @@ class ThermalHotspotDemo:
         self.root.title("PhysicalAI  ·  Thermal Hotspot Analysis Platform")
         self.root.configure(bg=C["bg"])
 
-        self.generator = ThermalImageGenerator(width=320, height=240, noise_std=1.5)
+        self.generator = DatasetBackedThermalGenerator(width=320, height=240, noise_std=1.5)
         self.opencv_detector = OpenCVHotspotDetector()
         self.yolo_pytorch_detector: Optional[YOLOv8PyTorchDetector] = None
         self.yolo_openvino_detector: Optional[OpenVINOYOLODetector] = None
@@ -370,6 +373,12 @@ class ThermalHotspotDemo:
         self._status_var = tk.StringVar(value="Initializing…")
         self.openvinoDeviceVar = tk.StringVar(value="CPU")
         self.openvinoPrecisionVar = tk.StringVar(value="F32")
+        self.powerClassVar = tk.StringVar(value="Auto")
+        self.gpuModeVar = tk.StringVar(value="Auto")
+        self.tmaxVar = tk.StringVar(value="—")
+        self.scenePowerClassVar = tk.StringVar(value="—")
+        self.sceneCoverageVar = tk.StringVar(value="—")
+        self.sceneGpuVar = tk.StringVar(value="—")
         self._kpi: dict[str, tk.StringVar] = {
             k: tk.StringVar(value="—")
             for k in (
@@ -386,8 +395,9 @@ class ThermalHotspotDemo:
             k: tk.StringVar(value="X —  Y —  Z —")
             for k in ("opencv", "pytorch", "openvino")
         }
-        self.hotspot_count: Optional[SidebarSlider] = None
+        self._sceneBadgeFrame: Optional[tk.Frame] = None
         self.noise_scale: Optional[SidebarSlider] = None
+        self.physics_threshold: Optional[SidebarSlider] = None
         self.benchmark_samples: Optional[tk.IntVar] = None
         self.skipAreaRect: Optional[tuple[int, int, int, int]] = None
         self.targetAreaRect: Optional[tuple[int, int, int, int]] = None
@@ -412,6 +422,8 @@ class ThermalHotspotDemo:
         self._sidebarResizing = False
         self._sidebarCollapsed = False
         self._openvinoPrecisionMenu: Optional[tk.Menu] = None
+        # No-cheat benchmark mode: do not use simulator GT region masks at inference time.
+        self.noCheatFocusMask = True
 
         try:
             state = self._load_ui_state()
@@ -690,15 +702,36 @@ class ThermalHotspotDemo:
 
         tk.Frame(sb, bg=C["border"], height=1).pack(fill=tk.X, pady=(14, 10))
 
-        tk.Label(sb, text="HOTSPOT CONFIGURATION", bg=C["sidebar"], fg=C["sidebar_accent"],
+        tk.Label(sb, text="DATASET PHYSICS", bg=C["sidebar"], fg=C["sidebar_accent"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W, padx=10, pady=(0, 8))
 
         cfgCard = self._sidebar_round_card(sb, pady=(0, 10), radius=14)
 
-        self.hotspot_count = self._sidebar_slider(
-            cfgCard, "Hotspot Count", 2, 4, 2, integer=True)
         self.noise_scale = self._sidebar_slider(
-            cfgCard, "Noise Level", 0.0, 5.0, 1.5, res=0.1)
+            cfgCard, "Noise Level", 0.0, 5.0, 1.5, res=0.1, decimals=1)
+        self.physics_threshold = self._sidebar_slider(
+            cfgCard, "Physics Threshold", 0.50, 0.95, 0.72, res=0.01, decimals=2)
+
+        controlFrame = tk.Frame(cfgCard, bg=C["sidebar_card"])
+        controlFrame.pack(fill=tk.X, padx=10, pady=(6, 10))
+
+        tk.Label(controlFrame, text="Power Class", bg=C["sidebar_card"], fg=C["text"],
+                 font=(FF, 9, "bold")).pack(anchor=tk.W)
+        powerMenu = tk.OptionMenu(controlFrame, self.powerClassVar, "Auto", "Thin", "Mainstream", "Gaming")
+        powerMenu.config(bg=C["accent"], fg=C["text"], activebackground=C["accent_dim"],
+                         activeforeground=C["text"], highlightthickness=0, bd=0, font=(FF, 9, "bold"))
+        powerMenu["menu"].config(bg="#23283A", fg=C["text"], activebackground=C["accent"],
+                                 activeforeground=C["text"], font=(FF, 9))
+        powerMenu.pack(fill=tk.X, pady=(6, 12))
+
+        tk.Label(controlFrame, text="dGPU", bg=C["sidebar_card"], fg=C["text"],
+                 font=(FF, 9, "bold")).pack(anchor=tk.W)
+        gpuMenu = tk.OptionMenu(controlFrame, self.gpuModeVar, "Auto", "On", "Off")
+        gpuMenu.config(bg=C["accent"], fg=C["text"], activebackground=C["accent_dim"],
+                       activeforeground=C["text"], highlightthickness=0, bd=0, font=(FF, 9, "bold"))
+        gpuMenu["menu"].config(bg="#23283A", fg=C["text"], activebackground=C["accent"],
+                               activeforeground=C["text"], font=(FF, 9))
+        gpuMenu.pack(fill=tk.X, pady=(6, 0))
 
         skipFrame = tk.Frame(cfgCard, bg=C["sidebar_card"])
         skipFrame.pack(fill=tk.X, padx=10, pady=(0, 0))
@@ -981,7 +1014,8 @@ class ThermalHotspotDemo:
     def _sidebar_slider(self, parent: tk.Frame, label: str,
                          from_: float, to: float, default: float,
                          res: float = 1.0,
-                         integer: bool = False) -> SidebarSlider:
+                         integer: bool = False,
+                         decimals: int = 1) -> SidebarSlider:
         panelBg = str(parent.cget("bg"))
         slider = SidebarSlider(
             parent,
@@ -991,6 +1025,7 @@ class ThermalHotspotDemo:
             default=default,
             resolution=res,
             integer=integer,
+            decimals=decimals,
             width=96,
         )
         slider.configure(bg=panelBg)
@@ -1352,13 +1387,39 @@ class ThermalHotspotDemo:
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_propagate(False)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
 
         tk.Label(right, text="RUN SUMMARY", bg=C["surface"], fg=C["dim"],
                  font=(FF, 8, "bold")).grid(row=0, column=0, padx=14,
                                              pady=(12, 4), sticky="w")
+        scene = tk.Frame(right, bg="#1B1F33", highlightbackground=C["border"], highlightthickness=1)
+        scene.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._sceneBadgeFrame = scene
+        scene.columnconfigure(0, weight=1)
+        scene.columnconfigure(1, weight=1)
+
+        tk.Label(scene, text="Power Class", bg="#1B1F33", fg=C["muted"],
+                 font=(FF, 8, "bold")).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        tk.Label(scene, textvariable=self.scenePowerClassVar, bg="#1B1F33", fg=C["text"],
+                 font=(FF, 10, "bold")).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
+
+        tk.Label(scene, text="Coverage", bg="#1B1F33", fg=C["muted"],
+                 font=(FF, 8, "bold")).grid(row=0, column=1, sticky="w", padx=8, pady=(6, 0))
+        tk.Label(scene, textvariable=self.sceneCoverageVar, bg="#1B1F33", fg=C["text"],
+                 font=(FF, 10, "bold")).grid(row=1, column=1, sticky="w", padx=8, pady=(0, 6))
+
+        tk.Label(scene, text="dGPU", bg="#1B1F33", fg=C["muted"],
+                 font=(FF, 8, "bold")).grid(row=2, column=0, sticky="w", padx=8, pady=(2, 0))
+        tk.Label(scene, textvariable=self.sceneGpuVar, bg="#1B1F33", fg=C["text"],
+                 font=(FF, 10, "bold")).grid(row=3, column=0, sticky="w", padx=8, pady=(0, 8))
+
+        tk.Label(scene, text="Tmax", bg="#1B1F33", fg=C["muted"],
+                 font=(FF, 8, "bold")).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
+        tk.Label(scene, textvariable=self.tmaxVar, bg="#1B1F33", fg=C["text"],
+                 font=(FF, 10, "bold")).grid(row=3, column=1, sticky="w", padx=8, pady=(0, 8))
+
         tf = tk.Frame(right, bg=C["surface"])
-        tf.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        tf.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         tf.columnconfigure(0, weight=1)
         tf.rowconfigure(0, weight=1)
         self.metrics_text = tk.Text(
@@ -1502,6 +1563,88 @@ class ThermalHotspotDemo:
         if self._dot:
             self._dot.config(fg=C["warning"] if busy else C["success"])
 
+    def _get_gt_point(self, frame=None) -> tuple[float, float]:
+        """Return the single GT point used for scoring and raw-input marker."""
+        ref = frame if frame is not None else self.current_frame
+        if ref is None:
+            return 0.0, 0.0
+
+        if getattr(ref, "hotspot_coordinate", None) is not None:
+            x, y = ref.hotspot_coordinate
+            return float(x), float(y)
+
+        image = getattr(ref, "image", None)
+        if image is not None:
+            # Fallback to the true global maximum on the visible thermal matrix.
+            temp = np.asarray(image, dtype=np.float32)
+            iy, ix = np.unravel_index(int(np.argmax(temp)), temp.shape)
+            return float(ix), float(iy)
+
+        if getattr(ref, "centers", None):
+            x, y = ref.centers[0]
+            return float(x), float(y)
+        return float(ref.width) * 0.5, float(ref.height) * 0.5
+
+    @staticmethod
+    def _argmax_with_mask(temp: np.ndarray, mask: np.ndarray | None) -> tuple[int, int]:
+        """Return hottest point (y, x) inside mask when available; otherwise global hottest."""
+        if mask is not None and np.any(mask):
+            masked = np.where(mask, temp, -np.inf)
+            idx = int(np.argmax(masked))
+            y, x = np.unravel_index(idx, temp.shape)
+            if np.isfinite(float(masked[y, x])):
+                return int(y), int(x)
+        y, x = np.unravel_index(int(np.argmax(temp)), temp.shape)
+        return int(y), int(x)
+
+    @staticmethod
+    def _point_in_mask(mask: np.ndarray | None, x: float, y: float) -> bool:
+        """Check whether floating-point pixel coordinate falls inside mask."""
+        if mask is None or mask.size == 0:
+            return False
+        h, w = mask.shape
+        ix = int(np.clip(round(float(x)), 0, w - 1))
+        iy = int(np.clip(round(float(y)), 0, h - 1))
+        return bool(mask[iy, ix])
+
+    @staticmethod
+    def _build_source_object_mask(frame) -> np.ndarray | None:
+        """Build union mask of heat-source objects and remove known excluded structures."""
+        region_masks = getattr(frame, "region_masks", None)
+        image = getattr(frame, "image", None)
+        if not isinstance(region_masks, dict) or image is None:
+            return None
+
+        h, w = np.asarray(image).shape[:2]
+        source_union = np.zeros((h, w), dtype=bool)
+        source_keys = ("cpu", "gpu", "heatpipe", "keyboard_area")
+        for key in source_keys:
+            raw = region_masks.get(key)
+            if raw is None:
+                continue
+            mask = np.asarray(raw)
+            if mask.shape != (h, w):
+                continue
+            source_union |= (mask > 0)
+
+        if not np.any(source_union):
+            return None
+
+        for excluded_key in ("vent", "hinge", "trap_zone"):
+            raw = region_masks.get(excluded_key)
+            if raw is None:
+                continue
+            mask = np.asarray(raw)
+            if mask.shape != (h, w):
+                continue
+            source_union &= ~(mask > 0)
+
+        return source_union
+
+    def _get_gt_overlay_centers(self, frame=None) -> list[tuple[float, float]]:
+        x, y = self._get_gt_point(frame)
+        return [(x, y)]
+
     def _update_kpi(self, results: dict, gt_x: float, gt_y: float) -> None:
         for mkey in ("opencv", "pytorch", "openvino"):
             if mkey in results:
@@ -1530,6 +1673,41 @@ class ThermalHotspotDemo:
         else:
             self._card_title_vars["openvino"].set(baseTitle)
 
+    def _resolve_linear_display_range(self, image: np.ndarray) -> tuple[float, float] | None:
+        """Return stable linear display range for 2D thermal matrices."""
+        if image.ndim != 2:
+            return None
+
+        low = float(np.min(image))
+        high = float(np.max(image))
+        if high <= low:
+            return (low, low + 1e-3)
+
+        frame = self.current_frame
+        range_low = low
+        range_high = high
+
+        # Keep upper range anchored to workload class max when available.
+        if frame is not None:
+            workload = str(getattr(frame, "workload", "")).strip().lower()
+            profile = getattr(self.generator, "WORKLOAD_PROFILES", {}).get(workload)
+            if isinstance(profile, dict) and "max_temp" in profile:
+                try:
+                    range_high = max(range_high, float(profile["max_temp"][1]) + 1.2)
+                except Exception:
+                    pass
+
+            temps = getattr(frame, "temperatures", None)
+            if temps:
+                try:
+                    range_high = max(range_high, float(np.max(np.asarray(temps, dtype=np.float32))) + 0.6)
+                except Exception:
+                    pass
+
+        range_low = max(18.0, min(range_low, float(np.percentile(image, 1.0)) - 1.0))
+        range_high = max(range_high, range_low + 6.0)
+        return range_low, range_high
+
     def _draw(self, key: str, image: np.ndarray,
                cmap: str = "inferno",
                centers=None, result=None,
@@ -1542,10 +1720,20 @@ class ThermalHotspotDemo:
         imgH, imgW = int(image.shape[0]), int(image.shape[1])
         if key in ("thermal", "opencv", "pytorch", "openvino"):
             # Keep all model cards on the same geometric reference and keyboard guide.
-            ax.imshow(image, cmap=cmap, aspect="auto", alpha=1.0, zorder=2)
+            imshow_kwargs = {"cmap": cmap, "aspect": "auto", "alpha": 1.0, "zorder": 2}
+            display_range = self._resolve_linear_display_range(image)
+            if display_range is not None:
+                imshow_kwargs["vmin"] = float(display_range[0])
+                imshow_kwargs["vmax"] = float(display_range[1])
+            ax.imshow(image, **imshow_kwargs)
             self._draw_keyboard_c_deck_reference(ax, image.shape)
         else:
-            ax.imshow(image, cmap=cmap, aspect="auto", alpha=1.0, zorder=2)
+            imshow_kwargs = {"cmap": cmap, "aspect": "auto", "alpha": 1.0, "zorder": 2}
+            display_range = self._resolve_linear_display_range(image)
+            if display_range is not None:
+                imshow_kwargs["vmin"] = float(display_range[0])
+                imshow_kwargs["vmax"] = float(display_range[1])
+            ax.imshow(image, **imshow_kwargs)
         if centers:
             ax.scatter([p[0] for p in centers], [p[1] for p in centers],
                        c="#22D3EE", s=50, marker="*", zorder=5)
@@ -1631,7 +1819,6 @@ class ThermalHotspotDemo:
                     fontsize=5.0,
                     alpha=0.98,
                     zorder=5,
-                    bbox={"boxstyle": "round,pad=0.05", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16},
                 )
 
             # Row 0: Esc + F row.
@@ -1706,8 +1893,7 @@ class ThermalHotspotDemo:
                     linewidth=0.55, alpha=0.55, zorder=4,
                 ))
                 ax.text(x0 + w0 * 0.08, modY + modH * 0.64, label,
-                        color="#FFFFFF", fontsize=5.0, alpha=0.98, zorder=5,
-                    bbox={"boxstyle": "round,pad=0.05", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16})
+                    color="#FFFFFF", fontsize=5.0, alpha=0.98, zorder=5)
 
             # Arrow cluster (common bottom-right placement).
             arrowRegionStart = 11.82
@@ -1739,13 +1925,13 @@ class ThermalHotspotDemo:
             rtX = arrowX0 + (arrowW + arrowGap) * 2 + arrowW * 0.22
             rtY = dnY
             ax.text(upX, upY, "^", color="#FFFFFF", fontsize=4.9, alpha=0.98, zorder=5,
-                    bbox={"boxstyle": "round,pad=0.04", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16})
+                    )
             ax.text(dnX, dnY, "v", color="#FFFFFF", fontsize=4.9, alpha=0.98, zorder=5,
-                    bbox={"boxstyle": "round,pad=0.04", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16})
+                    )
             ax.text(lfX, lfY, "<", color="#FFFFFF", fontsize=4.9, alpha=0.98, zorder=5,
-                    bbox={"boxstyle": "round,pad=0.04", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16})
+                    )
             ax.text(rtX, rtY, ">", color="#FFFFFF", fontsize=4.9, alpha=0.98, zorder=5,
-                    bbox={"boxstyle": "round,pad=0.04", "facecolor": "#000000", "edgecolor": "none", "alpha": 0.16})
+                    )
             # Touchpad and palm rest zones.
             padW = int(w * 0.30)
             padH = int(h * 0.18)
@@ -1812,7 +1998,7 @@ class ThermalHotspotDemo:
         self._cursorPoint = None
         self._set_thermal_cursor("arrow")
         self._draw("thermal", self.current_frame.image, cmap="inferno",
-                   centers=self.current_frame.centers, subtitle="raw input")
+               centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
         self._set_status("Select skip area: click top-left then bottom-right", busy=True)
 
     def start_target_area_selection(self) -> None:
@@ -1826,7 +2012,7 @@ class ThermalHotspotDemo:
         self._cursorPoint = None
         self._set_thermal_cursor("arrow")
         self._draw("thermal", self.current_frame.image, cmap="inferno",
-                   centers=self.current_frame.centers, subtitle="raw input")
+               centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
         self._set_status("Select target area: click top-left then bottom-right", busy=True)
 
     def clear_skip_area(self) -> None:
@@ -1856,7 +2042,7 @@ class ThermalHotspotDemo:
         if self.current_frame is None:
             return
         self._draw("thermal", self.current_frame.image, cmap="inferno",
-                   centers=self.current_frame.centers, subtitle="raw input")
+               centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
 
     def _set_thermal_cursor(self, cursorName: str = "arrow") -> None:
         """Set cursor style for thermal image canvas."""
@@ -1985,13 +2171,75 @@ class ThermalHotspotDemo:
         bottom = int(np.clip(max(y0, y1), deckY0, deckY1))
         return left, top, right, bottom
 
-    def _apply_skip_mask_for_detection(self, image: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _keyboard_surface_mask_from_geometry(image_shape: tuple[int, int]) -> np.ndarray:
+        """Approximate keyboard ROI from fixed laptop-deck geometry (no privileged masks)."""
+        img_h, img_w = int(image_shape[0]), int(image_shape[1])
+        mask = np.zeros((img_h, img_w), dtype=bool)
+        x0 = int(round(img_w * 0.04))
+        x1 = int(round(img_w * 0.96))
+        y0 = int(round(img_h * 0.20))
+        y1 = int(round(img_h * 0.68))
+        if x1 > x0 and y1 > y0:
+            mask[y0:y1, x0:x1] = True
+        return mask
+
+    def _build_detection_focus_mask(self, frame, image_shape: tuple[int, int]) -> np.ndarray | None:
+        """Build no-cheat detector search mask using geometric keyboard ROI only."""
+        del frame
+        img_h, img_w = int(image_shape[0]), int(image_shape[1])
+
+        keyboard_bool = self._keyboard_surface_mask_from_geometry((img_h, img_w))
+        if not np.any(keyboard_bool):
+            return None
+
+        focus_mask = keyboard_bool.copy()
+
+        # Exclude keyboard borders that are commonly affected by vent-side structure.
+        edge_exclusion = np.zeros_like(focus_mask, dtype=bool)
+        ys, xs = np.where(keyboard_bool)
+        if xs.size > 0 and ys.size > 0:
+            kx0, kx1 = int(np.min(xs)), int(np.max(xs))
+            ky0, ky1 = int(np.min(ys)), int(np.max(ys))
+            k_w = max(1, kx1 - kx0 + 1)
+            k_h = max(1, ky1 - ky0 + 1)
+            side_band = max(2, int(round(k_w * 0.08)))
+            top_band = max(2, int(round(k_h * 0.10)))
+
+            edge_exclusion[ky0:ky1 + 1, kx0:min(kx1 + 1, kx0 + side_band)] = True
+            edge_exclusion[ky0:ky1 + 1, max(kx0, kx1 - side_band + 1):kx1 + 1] = True
+            edge_exclusion[ky0:min(ky1 + 1, ky0 + top_band), kx0:kx1 + 1] = True
+
+        focus_mask &= ~edge_exclusion
+
+        if not np.any(focus_mask):
+            focus_mask = keyboard_bool
+
+        # Respect manual skip area in addition to semantic exclusion.
+        skip_rect = self._build_skip_area_for_detection()
+        if skip_rect is not None:
+            left, top, right, bottom = skip_rect
+            focus_mask[top:bottom + 1, left:right + 1] = False
+
+        if np.any(focus_mask):
+            return focus_mask
+        return None
+
+    def _apply_skip_mask_for_detection(self, image: np.ndarray, frame=None) -> np.ndarray:
+        ref = frame if frame is not None else self.current_frame
+        masked = image.copy()
+
+        focus_mask = self._build_detection_focus_mask(ref, masked.shape)
+        if focus_mask is not None:
+            fill_temp = float(np.percentile(masked[focus_mask], 5.0))
+            masked[~focus_mask] = fill_temp
+            return masked
+
         skip_rect = self._build_skip_area_for_detection()
         if skip_rect is None:
-            return image
+            return masked
 
         left, top, right, bottom = skip_rect
-        masked = image.copy()
         fill_temp = float(np.percentile(masked, 5.0))
         masked[top:bottom + 1, left:right + 1] = fill_temp
         return masked
@@ -2016,13 +2264,16 @@ class ThermalHotspotDemo:
     # ═══════════════════════════════════════════════════════════════════════
 
     def generate_new_frame(self) -> None:
-        self.generator.noise_std = float(self.noise_scale.get())
-        hotspot_count = int(self.hotspot_count.get())
+        self._set_scene_badge_visible(True)
+        self._apply_dataset_semantic_controls(self.generator)
         constraints = self._build_generation_constraints()
         self.current_frame = self.generator.generate(
-            hotspot_count=hotspot_count, shape=HotspotShape.CIRCULAR, **constraints)
+            hotspot_count=3, shape=HotspotShape.CIRCULAR, **constraints)
+        frame_tmax = float(np.max(self.current_frame.image))
+        self.tmaxVar.set(f"{frame_tmax:.1f} C")
+        self._update_scene_badge(self.current_frame)
         self._draw("thermal", self.current_frame.image, cmap="inferno",
-                    centers=self.current_frame.centers, subtitle="raw input")
+                centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
         self._draw("mask", self.current_frame.mask, cmap="gray",
                     subtitle="ground truth")
         for k in ("opencv", "pytorch", "openvino"):
@@ -2113,7 +2364,7 @@ class ThermalHotspotDemo:
     def _run_detections_threaded(self) -> None:
         try:
             results = {}
-            detection_image = self._apply_skip_mask_for_detection(self.current_frame.image)
+            detection_image = self._apply_skip_mask_for_detection(self.current_frame.image, self.current_frame)
             results["opencv"] = self.opencv_detector.detect(
                 detection_image)
             if self.yolo_pytorch_detector is None:
@@ -2143,6 +2394,8 @@ class ThermalHotspotDemo:
         if n <= 0:
             messagebox.showwarning("Warning", "Sample count must be > 0")
             return
+        self._clear_scene_badge()
+        self._set_scene_badge_visible(False)
         self._set_status(f"Batch Run in progress… ({n} samples)", busy=True)
         threading.Thread(target=self._run_benchmark_threaded,
                           args=(n,), daemon=True).start()
@@ -2173,18 +2426,18 @@ class ThermalHotspotDemo:
 
             stats = {k: {"error": [], "latency": [], "fps": [], "confidence": []}
                      for k in active_detectors}
-            gen = ThermalImageGenerator(
+            gen = DatasetBackedThermalGenerator(
                 width=self.generator.width,
                 height=self.generator.height,
                 noise_std=float(self.noise_scale.get()),
                 seed=20260630)
-            hotspot_count = int(self.hotspot_count.get())
+            self._apply_dataset_semantic_controls(gen)
             constraints = self._build_generation_constraints()
 
-            warm_frame = gen.generate(hotspot_count=hotspot_count,
+            warm_frame = gen.generate(hotspot_count=3,
                                        shape=HotspotShape.CIRCULAR,
                                        **constraints)
-            warm_image = self._apply_skip_mask_for_detection(warm_frame.image)
+            warm_image = self._apply_skip_mask_for_detection(warm_frame.image, warm_frame)
             for detector in active_detectors.values():
                 try:
                     detector.detect(warm_image)
@@ -2192,11 +2445,11 @@ class ThermalHotspotDemo:
                     pass
 
             for i in range(sample_count):
-                frame = gen.generate(hotspot_count=hotspot_count,
+                frame = gen.generate(hotspot_count=3,
                                      shape=HotspotShape.CIRCULAR,
                                      **constraints)
-                gt_x, gt_y = frame.centers[0]
-                detection_image = self._apply_skip_mask_for_detection(frame.image)
+                gt_x, gt_y = self._get_gt_point(frame)
+                detection_image = self._apply_skip_mask_for_detection(frame.image, frame)
                 for key, detector in active_detectors.items():
                     result = detector.detect(detection_image)
                     error = MetricsCalculator.localization_error(
@@ -2220,6 +2473,55 @@ class ThermalHotspotDemo:
             self.root.after(0, lambda: messagebox.showerror(
                 "Benchmark Error", errorMessage))
             self.root.after(0, lambda: self._set_status("Error", busy=True))
+
+    def _apply_dataset_semantic_controls(self, generator: DatasetBackedThermalGenerator) -> None:
+        """Apply dataset-meaningful UI controls to the generation backend."""
+        power_map = {
+            "Auto": None,
+            "Thin": "thin",
+            "Mainstream": "mainstream",
+            "Gaming": "gaming",
+        }
+        gpu_map = {
+            "Auto": "auto",
+            "On": "on",
+            "Off": "off",
+        }
+        selected_power = power_map.get(self.powerClassVar.get(), None)
+        selected_gpu = gpu_map.get(self.gpuModeVar.get(), "auto")
+        physics_thr = float(self.physics_threshold.get()) if self.physics_threshold is not None else 0.72
+        noise = float(self.noise_scale.get()) if self.noise_scale is not None else 1.5
+
+        generator.set_runtime_controls(
+            noise_std=noise,
+            physics_threshold=physics_thr,
+            power_class=selected_power,
+            force_gpu_mode=selected_gpu,
+        )
+
+    def _update_scene_badge(self, frame) -> None:
+        power_class = str(getattr(frame, "power_class", "unknown") or "unknown")
+        power_display = power_class.replace("_", " ").title() if power_class != "unknown" else "Unknown"
+        coverage = float(getattr(frame, "keyboard_plateau_coverage", 0.0))
+        dgpu_enabled = bool(getattr(frame, "dgpu_enabled", False))
+
+        self.scenePowerClassVar.set(power_display)
+        self.sceneCoverageVar.set(f"{coverage:.2f}")
+        self.sceneGpuVar.set("ON" if dgpu_enabled else "OFF")
+
+    def _clear_scene_badge(self) -> None:
+        self.scenePowerClassVar.set("—")
+        self.sceneCoverageVar.set("—")
+        self.sceneGpuVar.set("—")
+        self.tmaxVar.set("—")
+
+    def _set_scene_badge_visible(self, visible: bool) -> None:
+        if self._sceneBadgeFrame is None:
+            return
+        if visible:
+            self._sceneBadgeFrame.grid()
+        else:
+            self._sceneBadgeFrame.grid_remove()
 
     def _format_batch_benchmark_tagged_summary(self, stats: dict,
                                                sample_count: int) -> list[tuple[str, str]]:
@@ -2257,7 +2559,7 @@ class ThermalHotspotDemo:
             ("header", "BATCH RUN SUMMARY\n\n"),
             ("muted", f"  Samples  : {sample_count}\n"),
             ("muted", "  Stream   : shared (seed=20260630)\n"),
-            ("muted", "  GT       : frame.centers[0]\n\n"),
+            ("muted", "  GT       : frame.hotspot_coordinate (fallback centers[0])\n\n"),
         ]
 
         for key in ("opencv", "pytorch", "openvino"):
@@ -2305,9 +2607,9 @@ class ThermalHotspotDemo:
     def _display_results(self, results: dict) -> None:
         if not self._vis_frame.winfo_ismapped():
             self._vis_frame.grid()
-        gt_x, gt_y = self.current_frame.centers[0]
+        gt_x, gt_y = self._get_gt_point(self.current_frame)
         self._draw("thermal", self.current_frame.image, cmap="inferno",
-                    centers=self.current_frame.centers, subtitle="raw input")
+                centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
         self._draw("mask", self.current_frame.mask, cmap="gray",
                     subtitle="ground truth")
         best_err = min(
