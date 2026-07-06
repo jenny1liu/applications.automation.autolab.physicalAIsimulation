@@ -1,0 +1,4 @@
+enable_hybrid_strategy: true
+hybrid_reference_dir: thermal_dataset_generator\reference_ir
+hybrid_reference_weight: 0.5
+generated_by: auto_hybrid_weight_search
