@@ -33,3 +33,13 @@ models/*.bin
 # Local UI state
 .physicalai_ui_state.json
 **/.physicalai_ui_state.json
+
+# Generated outputs (do not commit)
+output/
+thermal_dataset_generator/output/
+thermal_dataset_generator/output_debug/
+thermal_dataset_generator/output_sensor_smoke/
+thermal_dataset_generator/reference_ir/
+
+# Diagnostic artifacts
+artifacts/*.png

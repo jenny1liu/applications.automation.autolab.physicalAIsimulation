@@ -1,6 +1,10 @@
 numpy>=1.24
 opencv-python>=4.8
+scipy>=1.10
 matplotlib>=3.8
+pillow>=10.0
+pyyaml>=6.0
+tqdm>=4.66
 openvino>=2024.0
 ultralytics>=8.0
 torch>=2.0
