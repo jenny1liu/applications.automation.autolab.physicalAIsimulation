@@ -21,6 +21,8 @@ Modular Python project for generating synthetic keyboard-deck thermal datasets f
 
 ## Installation
 
+Install from the project root (single requirements file for the whole repo):
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate

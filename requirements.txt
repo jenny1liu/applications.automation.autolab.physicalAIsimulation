@@ -1,12 +1,15 @@
+# Core stack (used by thermal_dataset_generator and thermal runtime)
 numpy>=1.24
 opencv-python>=4.8
-scipy>=1.10
 matplotlib>=3.8
-pillow>=10.0
 pyyaml>=6.0
 tqdm>=4.66
-openvino>=2024.0
-ultralytics>=8.0
+
+# Deep learning / inference (thermal UI and detectors)
 torch>=2.0
 torchvision>=0.15
+ultralytics>=8.0
+openvino>=2024.0
+
+# Robot simulation (optional, requires C++ build tools on Windows)
 pybullet>=3.2
