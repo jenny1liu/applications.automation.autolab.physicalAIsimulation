@@ -355,6 +355,268 @@ class SidebarScrollbar(tk.Canvas):
         self.create_polygon(points, smooth=True, fill=fill, outline=outline)
 
 
+class StyledDropdown(tk.Frame):
+    """Flat, bordered dropdown with a chevron and accent hover border."""
+
+    _BG            = "#20243A"   # resting background (matches card colour)
+    _BG_HOVER      = "#252B44"   # slightly lighter on hover
+    _BORDER        = "#2A2F4A"   # resting border
+    _BORDER_HOVER  = "#6366F1"   # accent border on hover
+    _ARROW_FG      = "#94A3B8"   # muted chevron at rest
+    _ARROW_FG_HOV  = "#F1F5F9"   # bright chevron on hover
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        options: tuple[str, ...],
+        textVar: tk.StringVar,
+        onSelect: Callable[[str], None],
+    ) -> None:
+        super().__init__(
+            parent,
+            bg=self._BG,
+            highlightbackground=self._BORDER,
+            highlightthickness=1,
+            bd=0,
+            height=28,
+            cursor="hand2",
+        )
+        self.pack_propagate(False)
+
+        self._menuItems = list(options)
+        self._textVar   = textVar
+        self._onSelect  = onSelect
+
+        # Build the popup menu.
+        self._menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg="#1A1D2B",
+            fg="#F1F5F9",
+            activebackground="#6366F1",
+            activeforeground="#F1F5F9",
+            bd=0,
+            relief="flat",
+            font=(FF, 9),
+        )
+        self._rebuild_menu()
+        self._build_widgets()
+
+    # ── Internal helpers ──────────────────────────────────────────────
+
+    def _rebuild_menu(self) -> None:
+        """Repopulate the popup menu from the current option list."""
+        self._menu.delete(0, tk.END)
+        for option in self._menuItems:
+            self._menu.add_command(
+                label=f" {option}",
+                command=lambda o=option: self._select(o),
+            )
+
+    def _build_widgets(self) -> None:
+        # Value label on the left
+        self._valueLabel = tk.Label(
+            self,
+            textvariable=self._textVar,
+            bg=self._BG,
+            fg="#F1F5F9",
+            font=(FF, 9),
+            anchor="w",
+            justify="left",
+            padx=8,
+            pady=0,
+            cursor="hand2",
+        )
+        self._valueLabel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Thin vertical separator before the chevron
+        self._sep = tk.Frame(self, bg=self._BORDER, width=1)
+        self._sep.pack(side=tk.LEFT, fill=tk.Y, pady=5)
+
+        # Chevron on the right
+        self._arrowLabel = tk.Label(
+            self,
+            text="▾",
+            bg=self._BG,
+            fg=self._ARROW_FG,
+            font=(FF, 13),
+            padx=7,
+            pady=0,
+            anchor="center",
+            cursor="hand2",
+        )
+        self._arrowLabel.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind events on all sub-widgets so the whole row responds uniformly.
+        for widget in (self, self._valueLabel, self._arrowLabel):
+            widget.bind("<Button-1>", self._open_menu)
+            widget.bind("<Enter>",    self._on_enter)
+            widget.bind("<Leave>",    self._on_leave)
+
+    def _select(self, option: str) -> None:
+        try:
+            self._textVar.set(option)
+            self._onSelect(option)
+        except Exception as exc:
+            messagebox.showerror("Dropdown Error", str(exc))
+
+    def _open_menu(self, _event=None) -> None:
+        try:
+            self._menu.tk_popup(
+                self.winfo_rootx(),
+                self.winfo_rooty() + self.winfo_height(),
+            )
+        except Exception:
+            pass
+        finally:
+            try:
+                self._menu.grab_release()
+            except Exception:
+                pass
+
+    def _on_enter(self, _event=None) -> None:
+        self.configure(highlightbackground=self._BORDER_HOVER, bg=self._BG_HOVER)
+        self._valueLabel.configure(bg=self._BG_HOVER)
+        self._arrowLabel.configure(bg=self._BG_HOVER, fg=self._ARROW_FG_HOV)
+        self._sep.configure(bg=self._BORDER_HOVER)
+
+    def _on_leave(self, _event=None) -> None:
+        self.configure(highlightbackground=self._BORDER, bg=self._BG)
+        self._valueLabel.configure(bg=self._BG)
+        self._arrowLabel.configure(bg=self._BG, fg=self._ARROW_FG)
+        self._sep.configure(bg=self._BORDER)
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def update_options(self, options: tuple[str, ...]) -> None:
+        """Replace all menu entries with a new set of options."""
+        self._menuItems = list(options)
+        self._rebuild_menu()
+
+
+class StyledCombobox(tk.Frame):
+    """Editable entry with up/down increment arrows, styled like StyledDropdown."""
+
+    _BG           = "#20243A"
+    _BG_HOVER     = "#252B44"
+    _BORDER       = "#2A2F4A"
+    _BORDER_HOVER = "#6366F1"
+    _ARROW_FG     = "#94A3B8"
+    _ARROW_FG_HOV = "#F1F5F9"
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        textVar: tk.StringVar,
+        step: int = 10,
+        minVal: int = 1,
+        maxVal: int = 9999,
+    ) -> None:
+        super().__init__(
+            parent,
+            bg=self._BG,
+            highlightbackground=self._BORDER,
+            highlightthickness=1,
+            bd=0,
+            height=28,
+        )
+        self.pack_propagate(False)
+
+        self._textVar = textVar
+        self._step    = step
+        self._minVal  = minVal
+        self._maxVal  = maxVal
+
+        # Editable entry on the left.
+        self._entry = tk.Entry(
+            self,
+            textvariable=self._textVar,
+            bg=self._BG,
+            fg="#F1F5F9",
+            font=(FF, 9),
+            insertbackground="#F1F5F9",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        # Thin vertical separator before the arrow buttons.
+        self._sep = tk.Frame(self, bg=self._BORDER, width=1)
+        self._sep.pack(side=tk.LEFT, fill=tk.Y, pady=5)
+
+        # Up / down buttons stacked on the right.
+        self._btnFrame = tk.Frame(self, bg=self._BG)
+        self._btnFrame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._upBtn = tk.Label(
+            self._btnFrame,
+            text="▲",
+            bg=self._BG,
+            fg=self._ARROW_FG,
+            font=(FF, 6),
+            padx=6,
+            pady=0,
+            anchor="center",
+            cursor="hand2",
+        )
+        self._upBtn.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Thin horizontal rule between the two buttons.
+        tk.Frame(self._btnFrame, bg=self._BORDER, height=1).pack(fill=tk.X)
+
+        self._downBtn = tk.Label(
+            self._btnFrame,
+            text="▼",
+            bg=self._BG,
+            fg=self._ARROW_FG,
+            font=(FF, 6),
+            padx=6,
+            pady=0,
+            anchor="center",
+            cursor="hand2",
+        )
+        self._downBtn.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+
+        self._upBtn.bind("<Button-1>",   lambda _e: self._increment())
+        self._downBtn.bind("<Button-1>", lambda _e: self._decrement())
+
+        for widget in (self, self._entry, self._btnFrame,
+                       self._upBtn, self._downBtn):
+            widget.bind("<Enter>", self._on_enter)
+            widget.bind("<Leave>", self._on_leave)
+
+    def _get_value(self) -> int:
+        try:
+            return int(self._textVar.get())
+        except (ValueError, TypeError):
+            return self._minVal
+
+    def _increment(self) -> None:
+        self._textVar.set(str(min(self._get_value() + self._step, self._maxVal)))
+
+    def _decrement(self) -> None:
+        self._textVar.set(str(max(self._get_value() - self._step, self._minVal)))
+
+    def _on_enter(self, _event=None) -> None:
+        self.configure(highlightbackground=self._BORDER_HOVER, bg=self._BG_HOVER)
+        self._entry.configure(bg=self._BG_HOVER)
+        self._btnFrame.configure(bg=self._BG_HOVER)
+        for btn in (self._upBtn, self._downBtn):
+            btn.configure(bg=self._BG_HOVER, fg=self._ARROW_FG_HOV)
+        self._sep.configure(bg=self._BORDER_HOVER)
+
+    def _on_leave(self, _event=None) -> None:
+        self.configure(highlightbackground=self._BORDER, bg=self._BG)
+        self._entry.configure(bg=self._BG)
+        self._btnFrame.configure(bg=self._BG)
+        for btn in (self._upBtn, self._downBtn):
+            btn.configure(bg=self._BG, fg=self._ARROW_FG)
+        self._sep.configure(bg=self._BORDER)
+
+
 class ThermalHotspotDemo:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -398,7 +660,7 @@ class ThermalHotspotDemo:
         self._sceneBadgeFrame: Optional[tk.Frame] = None
         self.noise_scale: Optional[SidebarSlider] = None
         self.physics_threshold: Optional[SidebarSlider] = None
-        self.benchmark_samples: Optional[tk.IntVar] = None
+        self.benchmark_samples: Optional[tk.StringVar] = None
         self.skipAreaRect: Optional[tuple[int, int, int, int]] = None
         self.targetAreaRect: Optional[tuple[int, int, int, int]] = None
         self._interactionMode: Optional[str] = None  # None | skip | target
@@ -421,7 +683,7 @@ class ThermalHotspotDemo:
         self._sidebarResizeStartWidth = 200
         self._sidebarResizing = False
         self._sidebarCollapsed = False
-        self._openvinoPrecisionMenu: Optional[tk.Menu] = None
+        self._openvinoPrecisionDropdown: Optional[StyledDropdown] = None
         # No-cheat benchmark mode: do not use simulator GT region masks at inference time.
         self.noCheatFocusMask = True
 
@@ -713,28 +975,32 @@ class ThermalHotspotDemo:
             cfgCard, "Physics Threshold", 0.50, 0.95, 0.72, res=0.01, decimals=2)
 
         controlFrame = tk.Frame(cfgCard, bg=C["sidebar_card"])
-        controlFrame.pack(fill=tk.X, padx=10, pady=(6, 10))
+        controlFrame.pack(fill=tk.X, padx=10, pady=(8, 0))
 
         tk.Label(controlFrame, text="Power Class", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
-        powerMenu = tk.OptionMenu(controlFrame, self.powerClassVar, "Auto", "Thin", "Mainstream", "Gaming")
-        powerMenu.config(bg=C["accent"], fg=C["text"], activebackground=C["accent_dim"],
-                         activeforeground=C["text"], highlightthickness=0, bd=0, font=(FF, 9, "bold"))
-        powerMenu["menu"].config(bg="#23283A", fg=C["text"], activebackground=C["accent"],
-                                 activeforeground=C["text"], font=(FF, 9))
-        powerMenu.pack(fill=tk.X, pady=(6, 12))
+        powerOptions = ("Auto", "Thin", "Mainstream", "Gaming")
+        self._powerClassMenuTextVar = tk.StringVar(value=self.powerClassVar.get())
+        StyledDropdown(
+            controlFrame,
+            options=powerOptions,
+            textVar=self._powerClassMenuTextVar,
+            onSelect=lambda opt: self.powerClassVar.set(opt),
+        ).pack(fill=tk.X, pady=(6, 0))
 
         tk.Label(controlFrame, text="dGPU", bg=C["sidebar_card"], fg=C["text"],
-                 font=(FF, 9, "bold")).pack(anchor=tk.W)
-        gpuMenu = tk.OptionMenu(controlFrame, self.gpuModeVar, "Auto", "On", "Off")
-        gpuMenu.config(bg=C["accent"], fg=C["text"], activebackground=C["accent_dim"],
-                       activeforeground=C["text"], highlightthickness=0, bd=0, font=(FF, 9, "bold"))
-        gpuMenu["menu"].config(bg="#23283A", fg=C["text"], activebackground=C["accent"],
-                               activeforeground=C["text"], font=(FF, 9))
-        gpuMenu.pack(fill=tk.X, pady=(6, 0))
+                 font=(FF, 9, "bold")).pack(anchor=tk.W, pady=(12, 0))
+        gpuOptions = ("Auto", "On", "Off")
+        self._gpuModeMenuTextVar = tk.StringVar(value=self.gpuModeVar.get())
+        StyledDropdown(
+            controlFrame,
+            options=gpuOptions,
+            textVar=self._gpuModeMenuTextVar,
+            onSelect=lambda opt: self.gpuModeVar.set(opt),
+        ).pack(fill=tk.X, pady=(6, 0))
 
         skipFrame = tk.Frame(cfgCard, bg=C["sidebar_card"])
-        skipFrame.pack(fill=tk.X, padx=10, pady=(0, 0))
+        skipFrame.pack(fill=tk.X, padx=10, pady=(14, 0))
         tk.Label(skipFrame, text="Skip Area", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
         self._sidebar_segmented_actions(
@@ -746,7 +1012,7 @@ class ThermalHotspotDemo:
         )
 
         targetFrame = tk.Frame(cfgCard, bg=C["sidebar_card"])
-        targetFrame.pack(fill=tk.X, padx=10, pady=(20, 10))
+        targetFrame.pack(fill=tk.X, padx=10, pady=(14, 10))
         tk.Label(targetFrame, text="Target Area", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
         self._sidebar_segmented_actions(
@@ -762,185 +1028,48 @@ class ThermalHotspotDemo:
 
         ovCard = self._sidebar_round_card(sb, pady=(0, 10), radius=14)
         openvinoFrame = tk.Frame(ovCard, bg=C["sidebar_card"])
-        openvinoFrame.pack(fill=tk.X, padx=10, pady=(6, 10))
+        openvinoFrame.pack(fill=tk.X, padx=10, pady=(8, 0))
         tk.Label(openvinoFrame, text="Execution Device", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
         openvinoOptions = ("CPU", "GPU", "NPU", "AUTO")
         self._openvinoMenuTextVar = tk.StringVar(value=self.openvinoDeviceVar.get())
-
-        openvinoDropdown = tk.Frame(openvinoFrame, bg=C["accent"], bd=0)
-        openvinoDropdown.pack(fill=tk.X, pady=(8, 0), ipady=2)
-
-        openvinoValueLabel = tk.Label(
-            openvinoDropdown,
-            textvariable=self._openvinoMenuTextVar,
-            bg=C["accent"],
-            fg=C["text"],
-            font=(FF, 9, "bold"),
-            anchor="w",
-            padx=10,
-            pady=5,
-            cursor="hand2",
-        )
-        openvinoValueLabel.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        openvinoArrowLabel = tk.Label(
-            openvinoDropdown,
-            text="▾",
-            bg=C["accent"],
-            fg=C["text"],
-            font=(FF, 10, "bold"),
-            padx=10,
-            pady=5,
-            cursor="hand2",
-        )
-        openvinoArrowLabel.pack(side=tk.RIGHT)
-
-        openvinoMenu = tk.Menu(openvinoDropdown, tearoff=0)
-        openvinoMenu.config(
-            bg="#23283A",
-            fg=C["text"],
-            activebackground=C["accent"],
-            activeforeground=C["text"],
-            bd=0,
-            font=(FF, 9),
-        )
-
-        def on_select_openvino_device(option: str) -> None:
-            self._on_openvino_device_select(option)
-
-        for option in openvinoOptions:
-            openvinoMenu.add_command(
-                label=f"  {option:<8}",
-                command=lambda selected=option: on_select_openvino_device(selected),
-            )
-
-        def _open_openvino_menu(_event=None) -> None:
-            try:
-                openvinoMenu.tk_popup(
-                    openvinoDropdown.winfo_rootx(),
-                    openvinoDropdown.winfo_rooty() + openvinoDropdown.winfo_height(),
-                )
-            finally:
-                openvinoMenu.grab_release()
-
-        def _ov_hover_enter(_event=None) -> None:
-            openvinoDropdown.config(bg=C["accent_dim"])
-            openvinoValueLabel.config(bg=C["accent_dim"])
-            openvinoArrowLabel.config(bg=C["accent_dim"])
-
-        def _ov_hover_leave(_event=None) -> None:
-            openvinoDropdown.config(bg=C["accent"])
-            openvinoValueLabel.config(bg=C["accent"])
-            openvinoArrowLabel.config(bg=C["accent"])
-
-        openvinoDropdown.bind("<Button-1>", _open_openvino_menu)
-        openvinoValueLabel.bind("<Button-1>", _open_openvino_menu)
-        openvinoArrowLabel.bind("<Button-1>", _open_openvino_menu)
-
-        openvinoDropdown.bind("<Enter>", _ov_hover_enter)
-        openvinoValueLabel.bind("<Enter>", _ov_hover_enter)
-        openvinoArrowLabel.bind("<Enter>", _ov_hover_enter)
-
-        openvinoDropdown.bind("<Leave>", _ov_hover_leave)
-        openvinoValueLabel.bind("<Leave>", _ov_hover_leave)
-        openvinoArrowLabel.bind("<Leave>", _ov_hover_leave)
+        StyledDropdown(
+            openvinoFrame,
+            options=openvinoOptions,
+            textVar=self._openvinoMenuTextVar,
+            onSelect=self._on_openvino_device_select,
+        ).pack(fill=tk.X, pady=(6, 0))
 
         precisionFrame = tk.Frame(ovCard, bg=C["sidebar_card"])
-        precisionFrame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        precisionFrame.pack(fill=tk.X, padx=10, pady=(12, 10))
         tk.Label(precisionFrame, text="Inference Precision", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
         self._openvinoPrecisionMenuTextVar = tk.StringVar(value=self.openvinoPrecisionVar.get())
-
-        precisionDropdown = tk.Frame(precisionFrame, bg=C["accent"], bd=0)
-        precisionDropdown.pack(fill=tk.X, pady=(8, 0), ipady=2)
-
-        precisionValueLabel = tk.Label(
-            precisionDropdown,
-            textvariable=self._openvinoPrecisionMenuTextVar,
-            bg=C["accent"],
-            fg=C["text"],
-            font=(FF, 9, "bold"),
-            anchor="w",
-            padx=10,
-            pady=5,
-            cursor="hand2",
+        self._openvinoPrecisionDropdown = StyledDropdown(
+            precisionFrame,
+            options=self._get_openvino_precision_options_for_device(self.openvinoDeviceVar.get()),
+            textVar=self._openvinoPrecisionMenuTextVar,
+            onSelect=self._on_openvino_precision_select,
         )
-        precisionValueLabel.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        precisionArrowLabel = tk.Label(
-            precisionDropdown,
-            text="▾",
-            bg=C["accent"],
-            fg=C["text"],
-            font=(FF, 10, "bold"),
-            padx=10,
-            pady=5,
-            cursor="hand2",
-        )
-        precisionArrowLabel.pack(side=tk.RIGHT)
-
-        precisionMenu = tk.Menu(precisionDropdown, tearoff=0)
-        precisionMenu.config(
-            bg="#23283A",
-            fg=C["text"],
-            activebackground=C["accent"],
-            activeforeground=C["text"],
-            bd=0,
-            font=(FF, 9),
-        )
-
-        def on_select_openvino_precision(option: str) -> None:
-            self._on_openvino_precision_select(option)
-
-        self._openvinoPrecisionMenu = precisionMenu
+        self._openvinoPrecisionDropdown.pack(fill=tk.X, pady=(6, 0))
         self._refresh_openvino_precision_menu()
-
-        def _open_precision_menu(_event=None) -> None:
-            try:
-                precisionMenu.tk_popup(
-                    precisionDropdown.winfo_rootx(),
-                    precisionDropdown.winfo_rooty() + precisionDropdown.winfo_height(),
-                )
-            finally:
-                precisionMenu.grab_release()
-
-        def _precision_hover_enter(_event=None) -> None:
-            precisionDropdown.config(bg=C["accent_dim"])
-            precisionValueLabel.config(bg=C["accent_dim"])
-            precisionArrowLabel.config(bg=C["accent_dim"])
-
-        def _precision_hover_leave(_event=None) -> None:
-            precisionDropdown.config(bg=C["accent"])
-            precisionValueLabel.config(bg=C["accent"])
-            precisionArrowLabel.config(bg=C["accent"])
-
-        precisionDropdown.bind("<Button-1>", _open_precision_menu)
-        precisionValueLabel.bind("<Button-1>", _open_precision_menu)
-        precisionArrowLabel.bind("<Button-1>", _open_precision_menu)
-
-        precisionDropdown.bind("<Enter>", _precision_hover_enter)
-        precisionValueLabel.bind("<Enter>", _precision_hover_enter)
-        precisionArrowLabel.bind("<Enter>", _precision_hover_enter)
-
-        precisionDropdown.bind("<Leave>", _precision_hover_leave)
-        precisionValueLabel.bind("<Leave>", _precision_hover_leave)
-        precisionArrowLabel.bind("<Leave>", _precision_hover_leave)
 
         tk.Label(sb, text="BATCH RUN", bg=C["sidebar"], fg=C["sidebar_accent"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W, padx=10, pady=(2, 8))
 
         benchCard = self._sidebar_round_card(sb, pady=(0, 10), radius=14)
         spf = tk.Frame(benchCard, bg=C["sidebar_card"])
-        spf.pack(fill=tk.X, padx=10, pady=(4, 8))
+        spf.pack(fill=tk.X, padx=10, pady=(6, 8))
         tk.Label(spf, text="Sampling Settings", bg=C["sidebar_card"], fg=C["text"],
                  font=(FF, 9, "bold")).pack(anchor=tk.W)
-        self.benchmark_samples = tk.IntVar(value=100)
-        tk.Spinbox(spf, from_=10, to=2000, increment=10,
-                   textvariable=self.benchmark_samples, width=8,
-                   bg=C["accent"], fg=C["text"], buttonbackground=C["accent"],
-                   highlightthickness=0, bd=0,
-                   relief="flat", font=(FF, 10), insertbackground=C["text"]).pack(fill=tk.X, pady=(4, 0), ipady=4)
+        self.benchmark_samples = tk.StringVar(value="100")
+        StyledCombobox(
+            spf,
+            textVar=self.benchmark_samples,
+            step=10,
+            minVal=1,
+            maxVal=9999,
+        ).pack(fill=tk.X, pady=(6, 0))
 
         tk.Label(sb, text="v2.0  ·  OpenVINO Platform",
                  bg=C["sidebar"], fg=C["dim"],
@@ -1205,16 +1334,10 @@ class ThermalHotspotDemo:
         return ("BF16", "F32", "F16")
 
     def _refresh_openvino_precision_menu(self) -> None:
-        if self._openvinoPrecisionMenu is None:
-            return
-
         options = self._get_openvino_precision_options_for_device(self.openvinoDeviceVar.get())
-        self._openvinoPrecisionMenu.delete(0, tk.END)
-        for option in options:
-            self._openvinoPrecisionMenu.add_command(
-                label=f"  {option:<8}",
-                command=lambda selected=option: self._on_openvino_precision_select(selected),
-            )
+
+        if self._openvinoPrecisionDropdown is not None:
+            self._openvinoPrecisionDropdown.update_options(options)
 
         normalized = self._normalize_openvino_precision(self.openvinoPrecisionVar.get())
         if normalized not in options:
