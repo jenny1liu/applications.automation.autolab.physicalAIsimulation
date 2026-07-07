@@ -43,3 +43,6 @@ thermal_dataset_generator/reference_ir/
 
 # Diagnostic artifacts
 artifacts/*.png
+
+# Benchmark_app results
+*.csv
