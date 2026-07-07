@@ -161,6 +161,18 @@ class GeneratorConfig:
     touchpad_conductivity_range: tuple[float, float] = (0.48, 0.72)
     heatpipe_conductivity_gain_range: tuple[float, float] = (1.4, 2.4)
     fan_flow_cooling_strength_range: tuple[float, float] = (0.9, 2.0)
+    thin_deck_spread_sigma_x_ratio_range: tuple[float, float] = (0.08, 0.10)
+    mainstream_deck_spread_sigma_x_ratio_range: tuple[float, float] = (0.10, 0.13)
+    gaming_deck_spread_sigma_x_ratio_range: tuple[float, float] = (0.13, 0.17)
+    thin_deck_spread_sigma_y_ratio_range: tuple[float, float] = (0.06, 0.08)
+    mainstream_deck_spread_sigma_y_ratio_range: tuple[float, float] = (0.08, 0.11)
+    gaming_deck_spread_sigma_y_ratio_range: tuple[float, float] = (0.11, 0.15)
+    thin_deck_spread_gain_range: tuple[float, float] = (0.18, 0.28)
+    mainstream_deck_spread_gain_range: tuple[float, float] = (0.26, 0.40)
+    gaming_deck_spread_gain_range: tuple[float, float] = (0.36, 0.56)
+    thin_palm_cooling_scale: float = 1.05
+    mainstream_palm_cooling_scale: float = 0.90
+    gaming_palm_cooling_scale: float = 0.75
     source_softening_sigma_scale: float = 0.010
     sink_softening_sigma_scale: float = 0.008
     final_smoothing_sigma_scale: float = 0.016
@@ -332,6 +344,26 @@ class GeneratorConfig:
             raise ValueError("physics_score_threshold must be in [0, 1]")
         if self.physics_max_attempts <= 0:
             raise ValueError("physics_max_attempts must be > 0")
+        for name, rng in (
+            ("thin_deck_spread_sigma_x_ratio_range", self.thin_deck_spread_sigma_x_ratio_range),
+            ("mainstream_deck_spread_sigma_x_ratio_range", self.mainstream_deck_spread_sigma_x_ratio_range),
+            ("gaming_deck_spread_sigma_x_ratio_range", self.gaming_deck_spread_sigma_x_ratio_range),
+            ("thin_deck_spread_sigma_y_ratio_range", self.thin_deck_spread_sigma_y_ratio_range),
+            ("mainstream_deck_spread_sigma_y_ratio_range", self.mainstream_deck_spread_sigma_y_ratio_range),
+            ("gaming_deck_spread_sigma_y_ratio_range", self.gaming_deck_spread_sigma_y_ratio_range),
+            ("thin_deck_spread_gain_range", self.thin_deck_spread_gain_range),
+            ("mainstream_deck_spread_gain_range", self.mainstream_deck_spread_gain_range),
+            ("gaming_deck_spread_gain_range", self.gaming_deck_spread_gain_range),
+        ):
+            if float(rng[0]) <= 0.0 or float(rng[1]) < float(rng[0]):
+                raise ValueError(f"{name} must be > 0 and max >= min")
+        for name, val in (
+            ("thin_palm_cooling_scale", self.thin_palm_cooling_scale),
+            ("mainstream_palm_cooling_scale", self.mainstream_palm_cooling_scale),
+            ("gaming_palm_cooling_scale", self.gaming_palm_cooling_scale),
+        ):
+            if float(val) <= 0.0:
+                raise ValueError(f"{name} must be > 0")
 
         for name, rng in (
             ("thin_cpu_temp_range", self.thin_cpu_temp_range),

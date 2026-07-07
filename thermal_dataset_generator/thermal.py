@@ -105,7 +105,9 @@ class ThermalSimulator:
         if layout.palm_rest.enabled:
             palm_mask = self._rect_mask(layout.palm_rest)
             component_masks["palm_rest"] = palm_mask
-            sink_map += palm_mask * self.rng.uniform(0.15, 0.45)
+            # Keep palm cooling moderate to avoid unrealistically tiny warm regions.
+            palm_cooling_scale = self._palm_cooling_scale_for_power_class(layout.power_class.name)
+            sink_map += palm_mask * self.rng.uniform(0.10, 0.30) * palm_cooling_scale
             k_palm = float(self.rng.uniform(*self.config.palm_rest_conductivity_range))
             conductivity_map[palm_mask > 0] = np.minimum(conductivity_map[palm_mask > 0], k_palm)
 
@@ -362,6 +364,26 @@ class ThermalSimulator:
             + trap_rise_map
             + auxiliary_rise_map
         ).astype(np.float32)
+
+        # Add a low-frequency deck spread term so warm area footprint is closer to real IR captures.
+        keyboard_bin = (keyboard_mask > 0).astype(np.float32)
+        palm_bin = (component_masks.get("palm_rest", np.zeros_like(temp, dtype=np.uint8)) > 0).astype(np.float32)
+        deck_mask = np.clip(keyboard_bin + palm_bin, 0.0, 1.0)
+        if np.any(deck_mask > 0):
+            core_source = (cpu_rise_map + gpu_rise_map + heatpipe_rise_map).astype(np.float32)
+            spread_sigma_x, spread_sigma_y, spread_gain_lo, spread_gain_hi = self._deck_spread_params_for_power_class(
+                layout.power_class.name
+            )
+            spread_sigma_x = max(4.0, self.size * spread_sigma_x)
+            spread_sigma_y = max(4.0, self.size * spread_sigma_y)
+            spread_field = cv2.GaussianBlur(core_source, (0, 0), sigmaX=spread_sigma_x, sigmaY=spread_sigma_y)
+            spread_peak = float(np.max(spread_field))
+            if spread_peak > 1e-6:
+                spread_field = spread_field / spread_peak
+                spread_gain = max(1.2, float(layout.cpu.temperature - ambient_temp)) * float(
+                    self.rng.uniform(spread_gain_lo, spread_gain_hi)
+                )
+                source_map += spread_field * deck_mask * spread_gain
 
         conductivity_map = np.clip(conductivity_map, 0.35, 3.0)
 
@@ -949,6 +971,37 @@ class ThermalSimulator:
         if power_class == "mainstream":
             return self.config.mainstream_trap_temp_range
         return self.config.gaming_trap_temp_range
+
+    def _deck_spread_params_for_power_class(self, power_class: str) -> tuple[float, float, float, float]:
+        """Return deck-spread sigma ratios and gain range for selected power class."""
+        if power_class == "thin":
+            return (
+                float(self.rng.uniform(*self.config.thin_deck_spread_sigma_x_ratio_range)),
+                float(self.rng.uniform(*self.config.thin_deck_spread_sigma_y_ratio_range)),
+                float(self.config.thin_deck_spread_gain_range[0]),
+                float(self.config.thin_deck_spread_gain_range[1]),
+            )
+        if power_class == "mainstream":
+            return (
+                float(self.rng.uniform(*self.config.mainstream_deck_spread_sigma_x_ratio_range)),
+                float(self.rng.uniform(*self.config.mainstream_deck_spread_sigma_y_ratio_range)),
+                float(self.config.mainstream_deck_spread_gain_range[0]),
+                float(self.config.mainstream_deck_spread_gain_range[1]),
+            )
+        return (
+            float(self.rng.uniform(*self.config.gaming_deck_spread_sigma_x_ratio_range)),
+            float(self.rng.uniform(*self.config.gaming_deck_spread_sigma_y_ratio_range)),
+            float(self.config.gaming_deck_spread_gain_range[0]),
+            float(self.config.gaming_deck_spread_gain_range[1]),
+        )
+
+    def _palm_cooling_scale_for_power_class(self, power_class: str) -> float:
+        """Return palm cooling scale by power class to preserve class-specific warm area size."""
+        if power_class == "thin":
+            return float(self.config.thin_palm_cooling_scale)
+        if power_class == "mainstream":
+            return float(self.config.mainstream_palm_cooling_scale)
+        return float(self.config.gaming_palm_cooling_scale)
 
     def _line_heat_source_with_progress(
         self,
