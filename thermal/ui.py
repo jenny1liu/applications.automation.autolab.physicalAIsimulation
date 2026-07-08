@@ -13,7 +13,7 @@ import numpy as np
 import cv2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Circle
 
 from thermal.metrics import MetricsCalculator
 from thermal.detectors.opencv_detector import OpenCVHotspotDetector
@@ -653,9 +653,15 @@ class ThermalHotspotDemo:
         self._img_cvs: dict[str, FigureCanvasTkAgg] = {}
         self._card_title_vars: dict[str, tk.StringVar] = {}
         self._sub_vars: dict[str, tk.StringVar] = {}
-        self._robot_xyz_vars: dict[str, tk.StringVar] = {
-            k: tk.StringVar(value="X —  Y —  Z —")
-            for k in ("opencv", "pytorch", "openvino")
+        self._kpi_acc_labels: dict[str, tk.Label] = {}
+        self._robot_x_vars: dict[str, tk.StringVar] = {
+            k: tk.StringVar(value="—") for k in ("opencv", "pytorch", "openvino")
+        }
+        self._robot_y_vars: dict[str, tk.StringVar] = {
+            k: tk.StringVar(value="—") for k in ("opencv", "pytorch", "openvino")
+        }
+        self._robot_z_vars: dict[str, tk.StringVar] = {
+            k: tk.StringVar(value="—") for k in ("opencv", "pytorch", "openvino")
         }
         self._sceneBadgeFrame: Optional[tk.Frame] = None
         self.noise_scale: Optional[SidebarSlider] = None
@@ -1478,7 +1484,7 @@ class ThermalHotspotDemo:
                 ("Processing Time", " ms", "lat", 16),
                 ("Frame Rate", " fps", "fps", 16),
                 ("Position Error", " px", "acc", 14),
-                ("Detection Confidence", " %", "conf", 14),
+                ("Confidence Score", " %", "conf", 14),
             ]):
                 r = idx // 2
                 c = idx % 2
@@ -1609,7 +1615,8 @@ class ThermalHotspotDemo:
         tk.Label(tbar, textvariable=sub, bg=C["card"], fg=C["muted"],
                  font=(FF, 8)).pack(side=tk.RIGHT, padx=10)
 
-        fig = Figure(figsize=(4.2 if colspan == 2 else 2.8, 2.6), dpi=80)
+        fig_h = 1.8 if key in ("opencv", "pytorch", "openvino") else 2.6
+        fig = Figure(figsize=(4.2 if colspan == 2 else 2.8, fig_h), dpi=80)
         fig.patch.set_facecolor(C["card"])
         ax = fig.add_subplot(111)
         ax.set_facecolor("#161929")
@@ -1637,10 +1644,10 @@ class ThermalHotspotDemo:
             metric_panel.rowconfigure(1, weight=1)
 
             for idx, (title_txt, unit, key_suffix, value_size) in enumerate([
-                ("Processing Time", "ms", "lat", 11),
-                ("Frame Rate", "fps", "fps", 11),
                 ("Position Error", "px", "acc", 11),
-                ("Detection Confidence", "%", "conf", 11),
+                ("Frame Rate", "fps", "fps", 11),
+                ("Processing Time", "ms", "lat", 11),
+                ("Confidence Score", "%", "conf", 11),
             ]):
                 rr = idx // 2
                 cc = idx % 2
@@ -1654,19 +1661,39 @@ class ThermalHotspotDemo:
                          font=(FF, 8, "normal")).pack(anchor=tk.W, padx=6, pady=(4, 0))
                 vrow = tk.Frame(cell, bg="#1B1F33")
                 vrow.pack(anchor=tk.W, padx=6, pady=(1, 4))
-                tk.Label(vrow, textvariable=self._kpi[f"{key}_{key_suffix}"],
+                valLabel = tk.Label(vrow, textvariable=self._kpi[f"{key}_{key_suffix}"],
                          bg="#1B1F33", fg=C["text"],
-                         font=(FF, value_size, "bold")).pack(side=tk.LEFT)
+                         font=(FF, value_size, "bold"))
+                valLabel.pack(side=tk.LEFT)
+                if key_suffix == "acc":
+                    self._kpi_acc_labels[key] = valLabel
                 tk.Label(vrow, text=f" {unit}", bg="#1B1F33", fg=C["text"],
                          font=(FF, 8)).pack(side=tk.LEFT, pady=(0, 1))
 
-                xyz_row = tk.Frame(card, bg=C["card"])
-                xyz_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
-                tk.Label(xyz_row, text="Robot Target Position", bg=C["card"], fg=C["muted"],
-                            font=(FF, 7, "bold")).pack(side=tk.LEFT)
-                tk.Label(xyz_row, textvariable=self._robot_xyz_vars[key],
-                            bg=C["card"], fg=C["muted"],
-                            font=("Consolas", 8)).pack(side=tk.LEFT, padx=(8, 0))
+            # Robot target position row — single-line display below the 4 KPI cells.
+            xyz_row = tk.Frame(card, bg="#161929",
+                               highlightbackground=C["accent"], highlightthickness=1)
+            xyz_row.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 6))
+            tk.Label(xyz_row, text="⬡ Robot Target (XYZ)", bg="#161929", fg=C["sidebar_accent"],
+                     font=(FF, 8, "bold")).pack(side=tk.LEFT, padx=(8, 8), pady=5)
+            _badge_center = tk.Frame(xyz_row, bg="#161929")
+            _badge_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            _badge_holder = tk.Frame(_badge_center, bg="#161929")
+            _badge_holder.pack(anchor=tk.CENTER, pady=5)
+            for axisLabel, axisVar in [
+                ("X:", self._robot_x_vars[key]),
+                ("Y:", self._robot_y_vars[key]),
+                ("Z:", self._robot_z_vars[key]),
+            ]:
+                badge = tk.Frame(_badge_holder, bg="#252B44",
+                                 highlightbackground=C["border"], highlightthickness=1)
+                badge.pack(side=tk.LEFT, padx=(0, 4))
+                tk.Label(badge, text=axisLabel, bg="#252B44", fg=C["muted"],
+                         font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=(4, 1), pady=2)
+                tk.Label(badge, textvariable=axisVar, bg="#252B44", fg=C["text"],
+                         font=("Consolas", 10, "bold")).pack(side=tk.LEFT, padx=(0, 4), pady=2)
+            tk.Label(xyz_row, text="(m)", bg="#161929", fg=C["muted"],
+                     font=(FF, 9)).pack(side=tk.LEFT, padx=(2, 8), pady=5)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1843,7 +1870,7 @@ class ThermalHotspotDemo:
         imgH, imgW = int(image.shape[0]), int(image.shape[1])
         if key in ("thermal", "opencv", "pytorch", "openvino"):
             # Keep all model cards on the same geometric reference and keyboard guide.
-            imshow_kwargs = {"cmap": cmap, "aspect": "auto", "alpha": 1.0, "zorder": 2}
+            imshow_kwargs = {"cmap": cmap, "aspect": "equal", "alpha": 1.0, "zorder": 2}
             display_range = self._resolve_linear_display_range(image)
             if display_range is not None:
                 imshow_kwargs["vmin"] = float(display_range[0])
@@ -1851,18 +1878,53 @@ class ThermalHotspotDemo:
             ax.imshow(image, **imshow_kwargs)
             self._draw_keyboard_c_deck_reference(ax, image.shape)
         else:
-            imshow_kwargs = {"cmap": cmap, "aspect": "auto", "alpha": 1.0, "zorder": 2}
+            imshow_kwargs = {"cmap": cmap, "aspect": "equal", "alpha": 1.0, "zorder": 2}
             display_range = self._resolve_linear_display_range(image)
             if display_range is not None:
                 imshow_kwargs["vmin"] = float(display_range[0])
                 imshow_kwargs["vmax"] = float(display_range[1])
             ax.imshow(image, **imshow_kwargs)
         if centers:
-            ax.scatter([p[0] for p in centers], [p[1] for p in centers],
-                       c="#22D3EE", s=50, marker="*", zorder=5)
+            r   = 2.0   # circle radius in data coords (pixels)
+            gap = 1.5   # gap between circle edge and line start
+            ln  = 6.0   # crosshair arm length
+            s   = 0.5   # spacing between dual arms (1px / 2)
+            
+            for (cx, cy) in centers:
+                # Outer black outline
+                ax.add_patch(Circle((cx, cy), r + 0.5, fill=False,
+                             edgecolor="black", linewidth=1, zorder=5))
+                
+                # 4 crosshair arms (up, down, left, right) - black and thicker
+                # Upper arm
+                ax.plot([cx, cx], [cy - (r+gap), cy - (r+gap+ln)], 
+                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                # Lower arm
+                ax.plot([cx, cx], [cy + (r+gap), cy + (r+gap+ln)], 
+                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                # Left arm
+                ax.plot([cx - (r+gap), cx - (r+gap+ln)], [cy, cy], 
+                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                # Right arm
+                ax.plot([cx + (r+gap), cx + (r+gap+ln)], [cy, cy], 
+                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
         if result is not None:
-            ax.scatter([result.center_x], [result.center_y],
-                       c="#EF4444", s=55, marker="x", zorder=6, linewidths=2)
+            cx, cy = result.center_x, result.center_y
+            r = 2.0
+            gap = 1.5
+            ln = 6.0
+            # Red circle outline
+            ax.add_patch(Circle((cx, cy), r + 0.5, fill=False,
+                         edgecolor="#EF4444", linewidth=1, zorder=5))
+            # 4 crosshair arms (red)
+            ax.plot([cx, cx], [cy - (r+gap), cy - (r+gap+ln)], 
+                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+            ax.plot([cx, cx], [cy + (r+gap), cy + (r+gap+ln)], 
+                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+            ax.plot([cx - (r+gap), cx - (r+gap+ln)], [cy, cy], 
+                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+            ax.plot([cx + (r+gap), cx + (r+gap+ln)], [cy, cy], 
+                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
         if key == "thermal":
             self._draw_hotspot_constraints(ax, image.shape)
 
@@ -2381,6 +2443,8 @@ class ThermalHotspotDemo:
         fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
         cv.draw()
         self._sub_vars[key].set("—")
+        if key in self._kpi_acc_labels:
+            self._kpi_acc_labels[key].configure(fg=C["text"])
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Core actions
@@ -2405,7 +2469,9 @@ class ThermalHotspotDemo:
             self._kpi[f"{k}_fps"].set("—")
             self._kpi[f"{k}_acc"].set("—")
             self._kpi[f"{k}_conf"].set("—")
-            self._robot_xyz_vars[k].set("X —  Y —  Z —")
+            self._robot_x_vars[k].set("—")
+            self._robot_y_vars[k].set("—")
+            self._robot_z_vars[k].set("—")
         if not self._vis_frame.winfo_ismapped():
             self._vis_frame.grid()
         self._set_status("Frame generated")
@@ -2712,7 +2778,7 @@ class ThermalHotspotDemo:
                 ("val", f"    {'mean':<{metricLabelWidth}}{s['fpsMean']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
                 ("val", f"    {'Median (P50)':<{metricLabelWidth}}{s['fpsMedian']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
                 ("val", f"    {'P95':<{metricLabelWidth}}{s['fpsP95']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
-                ("muted", "  Detection Confidence:\n"),
+                ("muted", "  Confidence Score:\n"),
                 ("val", f"    {'mean':<{metricLabelWidth}}{s['confidenceMean']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
                 ("val", f"    {'Median (P50)':<{metricLabelWidth}}{s['confidenceMedian']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
                 ("val", f"    {'P95':<{metricLabelWidth}}{s['confidenceP95']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n\n"),
@@ -2764,18 +2830,18 @@ class ThermalHotspotDemo:
                 elif self.yolo_openvino_detector is not None:
                     executionDeviceText = self.yolo_openvino_detector.get_execution_device_text()
                 self._set_openvino_card_title(executionDeviceText)
+            robot = self.robot_mapper.pixel_to_robot(r.center_x, r.center_y)
+            self._robot_x_vars[key].set(f"{robot.X:.3f}")
+            self._robot_y_vars[key].set(f"{robot.Y:.3f}")
+            self._robot_z_vars[key].set(f"{robot.Z:.3f}")
             self._draw(key, self.current_frame.image, cmap="inferno",
                         result=r,
-                        subtitle=(
-                            f"{r.inference_time_ms:.1f}ms  "
-                            f"{err:.1f}px  detection confidence {r.confidence * 100:.1f}%"
-                        ))
-            robot = self.robot_mapper.pixel_to_robot(r.center_x, r.center_y)
-            self._robot_xyz_vars[key].set(
-                f"X {robot.X:.3f}  Y {robot.Y:.3f}  Z {robot.Z:.3f}"
-            )
+                        subtitle="")
             is_best = abs(err - best_err) < 0.01
             is_fastest = abs(float(r.inference_time_ms) - best_latency) < 0.01
+            if key in self._kpi_acc_labels:
+                self._kpi_acc_labels[key].configure(
+                    fg=C["success"] if is_best else C["warning"])
             tagged += [
                 ("key",   f"{MODEL_DISPLAY_NAMES[key].upper()}\n"),
             ]
@@ -2791,12 +2857,8 @@ class ThermalHotspotDemo:
                 ("good" if is_fastest else "warn", f"{r.inference_time_ms:.2f} ms\n"),
                 ("muted", "  Frame Rate:            "),
                 ("val",   f"{fps:.0f} fps\n"),
-                ("muted", "  Detection Confidence:  "),
-                ("val",   f"{r.confidence * 100:.1f}%\n"),
-                ("muted", "  Robot Target Position:\n"),
-                ("muted", "    X: "), ("val", f"{robot.X:.3f}\n"),
-                ("muted", "    Y: "), ("val", f"{robot.Y:.3f}\n"),
-                ("muted", "    Z: "), ("val", f"{robot.Z:.3f}\n\n"),
+                ("muted", "  Confidence Score:     "),
+                ("val",   f"{r.confidence * 100:.1f}%\n\n"),
             ]
         self._update_kpi(results, gt_x, gt_y)
         self._set_status("Single Run complete")
