@@ -18,7 +18,7 @@ jobs:
 
       - name: Process PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MY_PAT }}
         run: |
           # 1. Create the PR
           echo "Creating PR..."
