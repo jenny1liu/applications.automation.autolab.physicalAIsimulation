@@ -27,7 +27,7 @@ jobs:
             --body "Auto-created, CI checked, and merged by GitHub Actions." \
             --base main \
             --head "${{ github.actor }}:${{ github.ref_name }}" \
-            --repo jenny/abc)
+            --repo jenny1liu/applications.automation.autolab.physicalAIsimulation)
           
           echo "PR created at $PR_URL"
 
