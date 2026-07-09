@@ -5,6 +5,13 @@ from shared.interfaces import ActionCommand, ActionType, CoordinateFrame, RobotT
 
 
 class TestRobotActionLayer(unittest.TestCase):
+    def test_executor_proxies_pybullet_resource_ids(self):
+        executor = PyBulletActionExecutor()
+
+        self.assertIsNone(executor.client_id)
+        self.assertIsNone(executor.robot_id)
+        self.assertIsNone(executor.plane_id)
+
     def test_validate_robot_interface_rejects_non_robot_base(self):
         executor = PyBulletActionExecutor()
         command = ActionCommand(

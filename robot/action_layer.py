@@ -255,6 +255,18 @@ class ActionExecutor:
         self.strategy = strategy
         self.config = config or RobotExecutionConfig()
 
+    @property
+    def client_id(self) -> Optional[int]:
+        return getattr(self.strategy, "client_id", None)
+
+    @property
+    def robot_id(self) -> Optional[int]:
+        return getattr(self.strategy, "robot_id", None)
+
+    @property
+    def plane_id(self) -> Optional[int]:
+        return getattr(self.strategy, "plane_id", None)
+
     def setup_environment(self) -> None:
         self.strategy.setup()
 
