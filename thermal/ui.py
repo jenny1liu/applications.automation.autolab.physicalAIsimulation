@@ -13,7 +13,8 @@ import numpy as np
 import cv2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle, Circle
+from matplotlib.patches import Rectangle, Circle, Polygon
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 
 from thermal.metrics import MetricsCalculator
 from thermal.detectors.opencv_detector import OpenCVHotspotDetector
@@ -51,6 +52,8 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
     "pytorch": "PyTorch (YOLOv8)",
     "openvino": "OpenVINO (YOLOv8)",
 }
+MODEL_IMAGE_WIDTH = 320
+MODEL_IMAGE_HEIGHT = 240
 
 
 class SidebarSlider(tk.Frame):
@@ -708,6 +711,12 @@ class ThermalHotspotDemo:
             # Keep defaults if state is missing or malformed.
             pass
 
+        # Create custom thermal colormap
+        self.thermal_cmap = self._create_thermal_colormap()
+        # Note: thermal_norm will be set dynamically per frame in _draw() 
+        # based on actual temperature range in the image
+        self.thermal_norm = None
+
         self._setup_ui()
         self._configure_window_size()
         self._initialize_default_models()
@@ -720,7 +729,8 @@ class ThermalHotspotDemo:
         # Keep margins for taskbar/window chrome to avoid off-screen bottom overflow.
         max_w = max(860, screen_w - 12)
         max_h = max(540, screen_h - 12)
-        min_w = min(1100, max(860, int(screen_w * 0.68)))
+        # Minimum width increased to accommodate 3 enlarged thermal image cards (420px each column)
+        min_w = min(2000, max(1200, int(screen_w * 0.75)))
         min_h = min(700, max(520, int(screen_h * 0.62)))
 
         state = self._load_ui_state()
@@ -798,6 +808,45 @@ class ThermalHotspotDemo:
             return None
         w, h, x, y = match.groups()
         return int(w), int(h), int(x), int(y)
+
+    @staticmethod
+    def _create_thermal_colormap() -> LinearSegmentedColormap:
+        """
+        Create custom thermal colormap with temperature-based color gradient.
+        Temperature range: 18°C (deep purple) -> 49°C (white)
+        """
+        # Define color stops: (temperature, hex color)
+        colors = [
+            (18,  "#2b004f"),    # Deep purple
+            (22,  "#3d00a0"),    # Purple
+            (26,  "#0040ff"),    # Blue
+            (30,  "#00d0ff"),    # Cyan
+            (33,  "#00ff40"),    # Light green
+            (36,  "#c0ff00"),    # Yellow-green
+            (39,  "#ffd000"),    # Orange-yellow
+            (42,  "#ff8000"),    # Orange
+            (44,  "#ff0000"),    # Red
+            (47,  "#ff80a0"),    # Pink-red
+            (49,  "#ffffff"),    # White
+        ]
+        
+        # Convert hex to RGB and normalize temperatures to [0, 1]
+        norm_colors = []
+        for temp, hex_color in colors:
+            # Convert hex to RGB
+            hex_color = hex_color.lstrip('#')
+            rgb = tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+            norm_pos = (temp - 18) / (49 - 18)
+            norm_colors.append((norm_pos, rgb))
+        
+        # Create colormap dict for LinearSegmentedColormap
+        cdict = {
+            'red':   [(pos, rgb[0], rgb[0]) for pos, rgb in norm_colors],
+            'green': [(pos, rgb[1], rgb[1]) for pos, rgb in norm_colors],
+            'blue':  [(pos, rgb[2], rgb[2]) for pos, rgb in norm_colors],
+        }
+        
+        return LinearSegmentedColormap('thermal', cdict)
 
     def _ui_state_path(self) -> Path:
         return Path(__file__).resolve().parent / UI_STATE_FILE
@@ -1444,10 +1493,11 @@ class ThermalHotspotDemo:
 
     def _build_body(self) -> None:
         self._body = tk.Frame(self._main, bg=C["bg"])
-        self._body.grid(row=1, column=0, sticky="nsew", padx=20, pady=12)
+        self._body.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        # Configure both columns: column 0 for visualization (expandable), column 1 for metrics (fixed width)
         self._body.columnconfigure(0, weight=1)
-        self._body.rowconfigure(0, weight=1)
         self._body.columnconfigure(1, weight=0)
+        self._body.rowconfigure(0, weight=1)
         self._build_vis_and_metrics(self._body)
 
     def _build_kpi_row(self, parent: tk.Frame) -> None:
@@ -1504,11 +1554,15 @@ class ThermalHotspotDemo:
 
     def _build_vis_and_metrics(self, parent: tk.Frame) -> None:
         self._vis_frame = tk.Frame(parent, bg=C["bg"])
-        self._vis_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        self._vis_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        # Configure columns with adequate minimum width to display thermal figures
+        # 4.8 inches * 80 dpi + card padding = 420 pixels minimum per column
+        min_col_width = 420
         for col in (0, 1, 2):
-            self._vis_frame.columnconfigure(col, weight=1, uniform="viz_col")
-        for row in (0, 1):
-            self._vis_frame.rowconfigure(row, weight=1)
+            self._vis_frame.columnconfigure(col, weight=1, minsize=min_col_width)
+        # Give the top row (thermal + reference cards) slightly more height.
+        self._vis_frame.rowconfigure(0, weight=12)
+        self._vis_frame.rowconfigure(1, weight=10)
 
         right = tk.Frame(parent, bg=C["surface"],
                           highlightbackground=C["border"],
@@ -1589,19 +1643,24 @@ class ThermalHotspotDemo:
         # thermal(openCV+pytorch span) aligns with openCV/pytorch,
         # and reference result aligns with openvino.
         if key == "thermal":
-            pad_x = (4, 4)
+            pad_x = (0, 1)
         elif key == "mask":
-            pad_x = (4, 4)
+            pad_x = (0, 0)
         elif row == 1 and colspan == 1:
-            pad_x = (4, 4)
+            pad_x = (0, 0)
         else:
-            pad_x = (0 if col == 0 else 8, 0)
+            pad_x = (0 if col == 0 else 1, 0)
         card.grid(row=row, column=col, columnspan=colspan,
                   padx=pad_x,
-                  pady=(0 if row == 0 else 8, 0),
+                  pady=(0, 0),
                   sticky="nsew")
         card.columnconfigure(0, weight=1)
-        card.rowconfigure(1, weight=1)
+        # Configure card's rows: title bar fixed height, Canvas expands
+        card.rowconfigure(0, weight=0)  # title bar - no expansion
+        card.rowconfigure(1, weight=1)  # Canvas - expand to fill available space
+        if key in ("opencv", "pytorch", "openvino"):
+            card.rowconfigure(2, weight=0, minsize=172)  # metric panel - fixed height
+            card.rowconfigure(3, weight=0, minsize=58)   # robot target - fixed height
 
         tbar = tk.Frame(card, bg=C["card"])
         tbar.grid(row=0, column=0, sticky="ew")
@@ -1609,14 +1668,15 @@ class ThermalHotspotDemo:
         titleVar = tk.StringVar(value=title)
         self._card_title_vars[key] = titleVar
         tk.Label(tbar, textvariable=titleVar, bg=C["card"], fg=C["text"],
-                 font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=10, pady=6)
+                 font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=8, pady=4)
         sub = tk.StringVar(value="—")
         self._sub_vars[key] = sub
         tk.Label(tbar, textvariable=sub, bg=C["card"], fg=C["muted"],
-                 font=(FF, 8)).pack(side=tk.RIGHT, padx=10)
+                 font=(FF, 8)).pack(side=tk.RIGHT, padx=8)
 
-        fig_h = 1.8 if key in ("opencv", "pytorch", "openvino") else 2.6
-        fig = Figure(figsize=(4.2 if colspan == 2 else 2.8, fig_h), dpi=80)
+        fig_h = 5.0 if key == "thermal" else 4.35
+        fig_w = 8.6 if key == "thermal" else 7.9
+        fig = Figure(figsize=(fig_w, fig_h), dpi=80)
         fig.patch.set_facecolor(C["card"])
         ax = fig.add_subplot(111)
         ax.set_facecolor("#161929")
@@ -1625,42 +1685,45 @@ class ThermalHotspotDemo:
         ax.axis("off")
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
-        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
+        fig.subplots_adjust(left=0.10, right=0.77,
+                    bottom=0.04, top=0.955)
 
         cv = FigureCanvasTkAgg(fig, master=card)
+        # Configure Canvas to fill available space - let grid system manage sizing
+        # Figsize (8.0x4.5 @80dpi = 640x360px) is fixed; Canvas scales display based on parent container
         cv.get_tk_widget().configure(bg=C["card"], highlightthickness=0)
         cv.get_tk_widget().grid(row=1, column=0, sticky="nsew",
-                                 padx=2, pady=(0, 2))
+                                 padx=0, pady=(0, 0))
         cv.draw()
         self._img_figs[key] = fig
         self._img_cvs[key] = cv
 
         if key in ("opencv", "pytorch", "openvino"):
             metric_panel = tk.Frame(card, bg=C["card"])
-            metric_panel.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+            metric_panel.grid(row=2, column=0, sticky="ew", padx=2, pady=(0, 2))
             metric_panel.columnconfigure(0, weight=1)
             metric_panel.columnconfigure(1, weight=1)
-            metric_panel.rowconfigure(0, weight=1)
-            metric_panel.rowconfigure(1, weight=1)
+            metric_panel.rowconfigure(0, weight=1, minsize=82)
+            metric_panel.rowconfigure(1, weight=1, minsize=82)
 
             for idx, (title_txt, unit, key_suffix, value_size) in enumerate([
-                ("Position Error", "px", "acc", 11),
-                ("Frame Rate", "fps", "fps", 11),
-                ("Processing Time", "ms", "lat", 11),
-                ("Confidence Score", "%", "conf", 11),
+                ("Position Error", "px", "acc", 16),
+                ("Frame Rate", "fps", "fps", 16),
+                ("Processing Time", "ms", "lat", 16),
+                ("Confidence Score", "%", "conf", 16),
             ]):
                 rr = idx // 2
                 cc = idx % 2
                 cell = tk.Frame(metric_panel, bg="#1B1F33", highlightbackground=C["border"],
                                 highlightthickness=1)
                 cell.grid(row=rr, column=cc, sticky="nsew",
-                          padx=(0 if cc == 0 else 4, 0),
-                          pady=(0 if rr == 0 else 4, 0))
+                          padx=(0 if cc == 0 else 3, 0),
+                          pady=(0 if rr == 0 else 3, 0))
 
                 tk.Label(cell, text=title_txt, bg="#1B1F33", fg=C["muted"],
-                         font=(FF, 8, "normal")).pack(anchor=tk.W, padx=6, pady=(4, 0))
+                         font=(FF, 12, "normal")).pack(anchor=tk.W, padx=6, pady=(5, 0))
                 vrow = tk.Frame(cell, bg="#1B1F33")
-                vrow.pack(anchor=tk.W, padx=6, pady=(1, 4))
+                vrow.pack(anchor=tk.W, padx=6, pady=(2, 5))
                 valLabel = tk.Label(vrow, textvariable=self._kpi[f"{key}_{key_suffix}"],
                          bg="#1B1F33", fg=C["text"],
                          font=(FF, value_size, "bold"))
@@ -1668,14 +1731,14 @@ class ThermalHotspotDemo:
                 if key_suffix == "acc":
                     self._kpi_acc_labels[key] = valLabel
                 tk.Label(vrow, text=f" {unit}", bg="#1B1F33", fg=C["text"],
-                         font=(FF, 8)).pack(side=tk.LEFT, pady=(0, 1))
+                         font=(FF, 12)).pack(side=tk.LEFT, pady=(0, 1))
 
             # Robot target position row — single-line display below the 4 KPI cells.
             xyz_row = tk.Frame(card, bg="#161929",
                                highlightbackground=C["accent"], highlightthickness=1)
-            xyz_row.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 6))
+            xyz_row.grid(row=3, column=0, sticky="ew", padx=2, pady=(1, 2))
             tk.Label(xyz_row, text="⬡ Robot Target (XYZ)", bg="#161929", fg=C["sidebar_accent"],
-                     font=(FF, 8, "bold")).pack(side=tk.LEFT, padx=(8, 8), pady=5)
+                     font=(FF, 12, "bold")).pack(side=tk.LEFT, padx=(8, 8), pady=5)
             _badge_center = tk.Frame(xyz_row, bg="#161929")
             _badge_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
             _badge_holder = tk.Frame(_badge_center, bg="#161929")
@@ -1689,11 +1752,11 @@ class ThermalHotspotDemo:
                                  highlightbackground=C["border"], highlightthickness=1)
                 badge.pack(side=tk.LEFT, padx=(0, 4))
                 tk.Label(badge, text=axisLabel, bg="#252B44", fg=C["muted"],
-                         font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=(4, 1), pady=2)
+                         font=(FF, 12, "bold")).pack(side=tk.LEFT, padx=(4, 1), pady=2)
                 tk.Label(badge, textvariable=axisVar, bg="#252B44", fg=C["text"],
-                         font=("Consolas", 10, "bold")).pack(side=tk.LEFT, padx=(0, 4), pady=2)
+                         font=("Consolas", 14, "bold")).pack(side=tk.LEFT, padx=(0, 4), pady=2)
             tk.Label(xyz_row, text="(m)", bg="#161929", fg=C["muted"],
-                     font=(FF, 9)).pack(side=tk.LEFT, padx=(2, 8), pady=5)
+                     font=(FF, 12)).pack(side=tk.LEFT, padx=(2, 8), pady=5)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1868,26 +1931,40 @@ class ThermalHotspotDemo:
         ax = fig.add_subplot(111)
         ax.set_facecolor("#161929")
         imgH, imgW = int(image.shape[0]), int(image.shape[1])
+        
+        # Calculate dynamic temperature range based on actual image data
+        temp_min = float(np.min(image))
+        temp_max = float(np.max(image))
+        # Add 2-degree margins for better color distribution
+        temp_min = max(15.0, temp_min - 2.0)
+        temp_max = min(65.0, temp_max + 2.0)
+        
+        # Use custom thermal colormap with dynamic normalization
+        dynamic_norm = Normalize(vmin=temp_min, vmax=temp_max)
+        imshow_kwargs = {"aspect": "equal", "alpha": 1.0, "zorder": 2}
+        imshow_kwargs["cmap"] = self.thermal_cmap
+        imshow_kwargs["norm"] = dynamic_norm
+        
+        im = ax.imshow(image, **imshow_kwargs)
+        
         if key in ("thermal", "opencv", "pytorch", "openvino"):
             # Keep all model cards on the same geometric reference and keyboard guide.
-            imshow_kwargs = {"cmap": cmap, "aspect": "equal", "alpha": 1.0, "zorder": 2}
-            display_range = self._resolve_linear_display_range(image)
-            if display_range is not None:
-                imshow_kwargs["vmin"] = float(display_range[0])
-                imshow_kwargs["vmax"] = float(display_range[1])
-            ax.imshow(image, **imshow_kwargs)
             self._draw_keyboard_c_deck_reference(ax, image.shape)
-        else:
-            imshow_kwargs = {"cmap": cmap, "aspect": "equal", "alpha": 1.0, "zorder": 2}
-            display_range = self._resolve_linear_display_range(image)
-            if display_range is not None:
-                imshow_kwargs["vmin"] = float(display_range[0])
-                imshow_kwargs["vmax"] = float(display_range[1])
-            ax.imshow(image, **imshow_kwargs)
+            
+            # Add colorbar on the right side with same height as image
+            # thermal uses smaller pad, model cards use standard pad
+            colorbar_pad = 0.025 if key == "thermal" else 0.05
+            cbar = fig.colorbar(im, ax=ax, orientation="vertical", pad=colorbar_pad, fraction=0.035, shrink=1.00)
+            cbar.set_label("Temperature (°C)", color=C["text"], fontsize=8, labelpad=12)
+            cbar.ax.tick_params(colors=C["text"], labelsize=7)
+            cbar.outline.set_edgecolor(C["border"])
+            for spine in cbar.ax.spines.values():
+                spine.set_edgecolor(C["border"])
+        
         if centers:
             r   = 2.0   # circle radius in data coords (pixels)
             gap = 1.5   # gap between circle edge and line start
-            ln  = 6.0   # crosshair arm length
+            ln  = 8.0   # crosshair arm length
             s   = 0.5   # spacing between dual arms (1px / 2)
             
             for (cx, cy) in centers:
@@ -1895,36 +1972,55 @@ class ThermalHotspotDemo:
                 ax.add_patch(Circle((cx, cy), r + 0.5, fill=False,
                              edgecolor="black", linewidth=1, zorder=5))
                 
-                # 4 crosshair arms (up, down, left, right) - black and thicker
-                # Upper arm
-                ax.plot([cx, cx], [cy - (r+gap), cy - (r+gap+ln)], 
-                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                # Upper marker: triangle with point toward circle (red fill, black edge)
+                tri_top = cy - (r+gap)
+                tri_bottom = cy - (r+gap+ln)
+                tri_width = 3.5
+                triangle = Polygon([
+                    (cx, tri_top),                   # top point (toward circle)
+                    (cx - tri_width, tri_bottom),    # bottom left
+                    (cx + tri_width, tri_bottom)     # bottom right
+                ], facecolor="#EF4444", edgecolor="black", linewidth=1, zorder=6)
+                ax.add_patch(triangle)
+                
                 # Lower arm
                 ax.plot([cx, cx], [cy + (r+gap), cy + (r+gap+ln)], 
-                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                        color="black", linewidth=2, solid_capstyle="butt", zorder=6)
                 # Left arm
                 ax.plot([cx - (r+gap), cx - (r+gap+ln)], [cy, cy], 
-                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                        color="black", linewidth=2, solid_capstyle="butt", zorder=6)
                 # Right arm
                 ax.plot([cx + (r+gap), cx + (r+gap+ln)], [cy, cy], 
-                        color="black", linewidth=3, solid_capstyle="butt", zorder=6)
+                        color="black", linewidth=2, solid_capstyle="butt", zorder=6)
         if result is not None:
             cx, cy = result.center_x, result.center_y
             r = 2.0
             gap = 1.5
-            ln = 6.0
-            # Red circle outline
+            ln = 8.0
+            # Black circle outline
             ax.add_patch(Circle((cx, cy), r + 0.5, fill=False,
-                         edgecolor="#EF4444", linewidth=1, zorder=5))
-            # 4 crosshair arms (red)
-            ax.plot([cx, cx], [cy - (r+gap), cy - (r+gap+ln)], 
-                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+                         edgecolor="black", linewidth=1, zorder=5))
+            
+            # Upper marker: triangle with point toward circle (red fill, black edge)
+            tri_top = cy - (r+gap)
+            tri_bottom = cy - (r+gap+ln)
+            tri_width = 3.5
+            triangle = Polygon([
+                (cx, tri_top),                   # top point (toward circle)
+                (cx - tri_width, tri_bottom),    # bottom left
+                (cx + tri_width, tri_bottom)     # bottom right
+            ], facecolor="#EF4444", edgecolor="black", linewidth=1, zorder=6)
+            ax.add_patch(triangle)
+            
+            # Lower arm (black)
             ax.plot([cx, cx], [cy + (r+gap), cy + (r+gap+ln)], 
-                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+                    color="black", linewidth=2, solid_capstyle="butt", zorder=6)
+            # Left arm (black)
             ax.plot([cx - (r+gap), cx - (r+gap+ln)], [cy, cy], 
-                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+                    color="black", linewidth=2, solid_capstyle="butt", zorder=6)
+            # Right arm (black)
             ax.plot([cx + (r+gap), cx + (r+gap+ln)], [cy, cy], 
-                    color="#EF4444", linewidth=3, solid_capstyle="butt", zorder=6)
+                    color="black", linewidth=2, solid_capstyle="butt", zorder=6)
         if key == "thermal":
             self._draw_hotspot_constraints(ax, image.shape)
 
@@ -1935,7 +2031,10 @@ class ThermalHotspotDemo:
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
         ax.axis("off")
-        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
+        # Keep thermal card margins controlled by the initial card setup.
+        if key != "thermal":
+            fig.subplots_adjust(left=0.10, right=0.90,
+                                bottom=0.04, top=0.955)
         cv.draw()
         self._sub_vars[key].set(subtitle)
 
@@ -2429,6 +2528,28 @@ class ThermalHotspotDemo:
         masked[top:bottom + 1, left:right + 1] = fill_temp
         return masked
 
+    def _get_model_display_image(self, image: np.ndarray) -> np.ndarray:
+        if image is None or image.size == 0:
+            return image
+
+        image_height, image_width = image.shape[:2]
+        if (image_width, image_height) == (MODEL_IMAGE_WIDTH, MODEL_IMAGE_HEIGHT):
+            return image
+
+        interpolation = cv2.INTER_AREA
+        if image_width < MODEL_IMAGE_WIDTH or image_height < MODEL_IMAGE_HEIGHT:
+            interpolation = cv2.INTER_LINEAR
+
+        try:
+            return cv2.resize(
+                image,
+                (MODEL_IMAGE_WIDTH, MODEL_IMAGE_HEIGHT),
+                interpolation=interpolation,
+            )
+        except Exception as e:
+            print(f"Model image resize failed: {e}")
+            return image
+
     def _clear_card(self, key: str) -> None:
         fig = self._img_figs[key]
         cv  = self._img_cvs[key]
@@ -2797,6 +2918,7 @@ class ThermalHotspotDemo:
         if not self._vis_frame.winfo_ismapped():
             self._vis_frame.grid()
         gt_x, gt_y = self._get_gt_point(self.current_frame)
+        model_display_image = self._get_model_display_image(self.current_frame.image)
         self._draw("thermal", self.current_frame.image, cmap="inferno",
                 centers=self._get_gt_overlay_centers(self.current_frame), subtitle="raw input")
         self._draw("mask", self.current_frame.mask, cmap="gray",
@@ -2834,7 +2956,7 @@ class ThermalHotspotDemo:
             self._robot_x_vars[key].set(f"{robot.X:.3f}")
             self._robot_y_vars[key].set(f"{robot.Y:.3f}")
             self._robot_z_vars[key].set(f"{robot.Z:.3f}")
-            self._draw(key, self.current_frame.image, cmap="inferno",
+            self._draw(key, model_display_image, cmap="inferno",
                         result=r,
                         subtitle="")
             is_best = abs(err - best_err) < 0.01
