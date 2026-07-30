@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>全能標註工具 — 框選／熱點／對應點</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root {
+    --bg: #12161B;
+    --panel: #1B2129;
+    --panel-2: #222A33;
+    --line: #313A45;
+    --text: #E7ECF2;
+    --muted: #8A97A6;
+    --accent: #E9A23B;
+    --accent-2: #3FB8AF;
+    --danger: #E0654A;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Noto Sans TC", sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    padding: 16px 28px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .title-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: 0.2px; }
+  h1 span { color: var(--accent); font-weight: 400; }
+  #progress { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+
+  .tabs { display: flex; gap: 4px; }
+  .tab {
+    padding: 9px 18px;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .setup {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    align-items: end;
+    padding: 16px 28px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  .field input[type=text] {
+    font-family: inherit; font-size: 13px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px; width: 160px;
+  }
+  input[type=file] { font-size: 12.5px; color: var(--text); max-width: 260px; }
+
+  button {
+    font-family: inherit; font-size: 13px; font-weight: 600;
+    padding: 9px 16px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  button:hover { background: #2A3340; border-color: #445064; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1A1300; }
+  button.primary:hover { background: #F0AE52; }
+  button.ghost { background: transparent; }
+  button.danger-ghost { color: var(--danger); border-color: #4A2B24; }
+
+  .nav-bar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 28px; background: var(--panel-2); border-bottom: 1px solid var(--line);
+  }
+  .nav-bar #navProgress { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .nav-bar .key-hint { font-size: 12px; color: var(--muted); }
+
+  main { padding: 20px 28px 32px; }
+
+  .single-stage .pane { max-width: 900px; margin: 0 auto; }
+  .pair-stage { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .pane-title {
+    font-size: 12px; font-weight: 650; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.6px; margin: 0 0 8px 2px;
+    display: flex; justify-content: space-between;
+  }
+  .pane-title .fname { color: var(--text); text-transform: none; font-family: var(--mono); font-weight: 400; font-size: 11.5px; opacity: 0.75; }
+  .canvas-wrap {
+    background: #0B0E12; border-radius: 6px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 380px;
+  }
+  canvas { display: block; cursor: crosshair; max-width: 100%; }
+  .empty-hint { color: var(--muted); font-size: 13px; padding: 40px; text-align: center; }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .toolbar .spacer { flex: 1; }
+  .hint-bar {
+    margin-top: 10px; font-size: 12.5px; color: var(--muted);
+    padding: 9px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+  }
+  .hint-bar b { color: var(--accent-2); }
+
+  .anno-list {
+    margin-top: 14px; font-family: var(--mono); font-size: 12px; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 8px;
+  }
+  .anno-chip { padding: 4px 9px; border-radius: 5px; background: var(--panel-2); border: 1px solid var(--line); }
+  .anno-chip .n { font-weight: 700; }
+  .anno-chip .rm { margin-left: 6px; color: var(--danger); cursor: pointer; }
+
+  .toast {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-20px);
+    background: var(--accent-2); color: #071613; font-weight: 700; font-size: 13.5px;
+    padding: 10px 20px; border-radius: 8px; opacity: 0; pointer-events: none;
+    transition: opacity 0.18s, transform 0.18s; z-index: 50;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  .mode-panel { display: none; }
+  .mode-panel.active { display: block; }
+
+  .tool-toggle { opacity: 0.6; }
+  .tool-toggle.active { background: var(--accent); border-color: var(--accent); color: #1A1300; opacity: 1; }
+</style>
+</head>
+<body>
+
+<div class="toast" id="toast"></div>
+
+<header>
+  <div class="title-row">
+    <h1>全能標註工具 <span>／ 框選・熱點・對應點</span></h1>
+    <div id="progress">選擇模式後開始</div>
+  </div>
+  <div class="tabs">
+    <button class="tab active" data-mode="bbox">① C-cover 框選＋熱點標記</button>
+    <button class="tab" data-mode="pair">② 對應點配對（Point Pair）</button>
+  </div>
+</header>
+
+<!-- ===== BBOX + POINT combined load bar ===== -->
+<div class="setup mode-panel active" id="setup-single">
+  <div class="field">
+    <label>照片（可多選，依檔名排序）</label>
+    <input type="file" id="singleFiles" accept="image/*" multiple>
+  </div>
+  <div class="field" id="classField">
+    <label>C-cover 框類別名稱</label>
+    <input type="text" id="className" value="c_cover">
+  </div>
+  <button class="primary" id="loadSingleBtn">批次載入</button>
+  <div class="spacer" style="flex:1"></div>
+  <button id="exportSingleBtn" disabled>匯出 ZIP（框＋熱點）</button>
+</div>
+
+<!-- ===== PAIR load bar ===== -->
+<div class="setup mode-panel" id="setup-pair">
+  <div class="field">
+    <label>CE 標註照片（可多選，依檔名排序配對）</label>
+    <input type="file" id="ceFiles" accept="image/*" multiple>
+  </div>
+  <div class="field">
+    <label>新照片（可多選，依檔名排序配對）</label>
+    <input type="file" id="newFiles" accept="image/*" multiple>
+  </div>
+  <button class="primary" id="loadPairBtn">批次載入</button>
+  <div class="field" style="flex-direction:row; align-items:center; gap:8px;">
+    <input type="checkbox" id="autoAdvance" checked style="width:16px;height:16px;">
+    <label style="text-transform:none; font-size:13px; color:var(--text);">每組標 1 個點，完成後自動跳下一組</label>
+  </div>
+  <div class="spacer" style="flex:1"></div>
+  <button id="exportPairBtn" disabled>匯出 JSON</button>
+</div>
+
+<div class="nav-bar" id="navBar" style="display:none;">
+  <button class="primary" id="prevBtn">← 上一張</button>
+  <span id="navProgress"></span>
+  <button class="primary" id="nextBtn">下一張 →</button>
+  <span class="key-hint" id="navHint">（也可以直接按鍵盤 ← →）</span>
+</div>
+
+<main>
+  <!-- ===== BBOX + POINT combined workspace ===== -->
+  <div class="mode-panel active" id="stage-bbox">
+    <div class="toolbar" style="margin-top:0;">
+      <button class="tool-toggle active" id="toolQuadBtn">▱ 畫框（四角可調）</button>
+      <button class="tool-toggle" id="toolPointBtn">● 標熱點</button>
+    </div>
+    <div class="single-stage">
+      <div class="pane">
+        <div class="pane-title">C-cover 框選＋熱點標記　<span class="fname" id="bboxName">—</span></div>
+        <div class="canvas-wrap" id="bboxWrap"><div class="empty-hint">載入照片後顯示於此</div></div>
+      </div>
+    </div>
+    <div class="hint-bar" id="bboxHint">
+      <b>畫框模式</b>：依序點 4 個角，順著物體的角度點（不用是矩形），點完第 4 個角會自動封閉成框。之後可以直接拖曳任一角上的小方塊調整位置。
+    </div>
+    <div class="toolbar">
+      <button class="ghost" id="undoBboxBtn" disabled>復原上一步（框或點皆可）</button>
+      <button class="danger-ghost ghost" id="clearBboxBtn" disabled>清空這張全部標註</button>
+    </div>
+    <div class="anno-list" id="bboxList"></div>
+  </div>
+
+  <!-- ===== PAIR workspace ===== -->
+  <div class="mode-panel" id="stage-pair">
+    <div class="pair-stage">
+      <div class="pane">
+        <div class="pane-title">CE 標註照片　<span class="fname" id="ceName">—</span></div>
+        <div class="canvas-wrap" id="ceWrap"><div class="empty-hint">載入照片後顯示於此</div></div>
+      </div>
+      <div class="pane">
+        <div class="pane-title">新照片　<span class="fname" id="newName">—</span></div>
+        <div class="canvas-wrap" id="newWrap"><div class="empty-hint">載入照片後顯示於此</div></div>
+      </div>
+    </div>
+    <div class="hint-bar">標註方式：先點左邊 CE 照片上的量測點，再點右邊新照片上對應的同一個位置，即完成一組配對（自動編號、配色一致）。</div>
+    <div class="toolbar">
+      <button class="ghost" id="undoPairBtn" disabled>復原上一步</button>
+      <button class="danger-ghost ghost" id="clearPairBtn" disabled>清空這組的點</button>
+    </div>
+    <div class="anno-list" id="pairList"></div>
+  </div>
+</main>
+
+<script>
+const PALETTE = ["#E9A23B", "#3FB8AF", "#8E7CC3", "#E0654A", "#6FCF97", "#56A8E8", "#D998C6", "#C9A227"];
+let mode = "bbox";
+
+// ---- shared state per mode ----
+const state = {
+  bbox: { items: [], current: 0, canvasInfo: null, drawingCorners: [], draggingHandle: null, mousePos: null },
+  pair: { items: [], current: 0, pendingCe: null, ceInfo: null, newInfo: null },
+};
+
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(showToast._timer);
+  showToast._timer = setTimeout(() => t.classList.remove("show"), 1600);
+}
+
+function loadImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// ================= TAB SWITCHING =================
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    mode = btn.dataset.mode;
+    document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b === btn));
+    document.getElementById("setup-single").classList.toggle("active", mode === "bbox");
+    document.getElementById("setup-pair").classList.toggle("active", mode === "pair");
+    document.getElementById("stage-bbox").classList.toggle("active", mode === "bbox");
+    document.getElementById("stage-pair").classList.toggle("active", mode === "pair");
+    refreshNavBar();
+  });
+});
+
+function currentModeState() { return state[mode]; }
+function currentItems() { return mode === "pair" ? state.pair.items : currentModeState().items; }
+
+function refreshNavBar() {
+  const items = currentItems();
+  const navBar = document.getElementById("navBar");
+  if (items.length === 0) { navBar.style.display = "none"; return; }
+  navBar.style.display = "flex";
+  const idx = currentModeState().current;
+  document.getElementById("navProgress").textContent = `第 ${idx + 1} / ${items.length} ${mode === "pair" ? "組" : "張"}`;
+  document.getElementById("prevBtn").disabled = idx === 0;
+  document.getElementById("nextBtn").disabled = idx === items.length - 1;
+  const hint = document.getElementById("navHint");
+  hint.textContent = items.length === 1 ? "（這批只載入了 1 " + (mode === "pair" ? "組" : "張") + "）" : (idx === items.length - 1 ? "（已經是最後一" + (mode === "pair" ? "組" : "張") + "）" : "（也可以直接按鍵盤 ← →）");
+}
+
+document.getElementById("prevBtn").addEventListener("click", () => navStep(-1));
+document.getElementById("nextBtn").addEventListener("click", () => navStep(1));
+document.addEventListener("keydown", (e) => {
+  if (currentItems().length === 0) return;
+  if (e.key === "ArrowRight") navStep(1);
+  if (e.key === "ArrowLeft") navStep(-1);
+});
+function navStep(delta) {
+  const st = currentModeState();
+  const items = currentItems();
+  const next = st.current + delta;
+  if (next < 0 || next > items.length - 1) return;
+  st.current = next;
+  renderCurrent();
+}
+
+// ================= CANVAS HELPERS =================
+function makeBaseCanvas(wrapEl, img) {
+  wrapEl.innerHTML = "";
+  const maxW = wrapEl.clientWidth || 820;
+  const maxH = 520;
+  const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
+  const canvas = document.createElement("canvas");
+  canvas.width = img.naturalWidth * scale;
+  canvas.height = img.naturalHeight * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  wrapEl.appendChild(canvas);
+  return { canvas, ctx, scale, img };
+}
+function toImgCoords(canvas, scale, e) {
+  const rect = canvas.getBoundingClientRect();
+  return [(e.clientX - rect.left) / scale, (e.clientY - rect.top) / scale];
+}
+
+// ================= BBOX MODE =================
+document.getElementById("loadSingleBtn").addEventListener("click", async () => {
+  const files = Array.from(document.getElementById("singleFiles").files).sort((a, b) => a.name.localeCompare(b.name));
+  if (files.length === 0) { alert("請選擇至少一張照片"); return; }
+  const items = [];
+  for (const f of files) {
+    const img = await loadImage(f);
+    items.push({ file: f.name, fileObj: f, img, boxes: [], points: [], history: [] });
+  }
+  state.bbox.items = items;
+  state.bbox.current = 0;
+  document.getElementById("exportSingleBtn").disabled = false;
+  renderCurrent();
+  refreshNavBar();
+});
+
+const HANDLE_HIT_RADIUS = 9; // screen pixels for grabbing an existing corner handle
+let activeTool = "quad"; // "quad" | "point"
+
+document.getElementById("toolQuadBtn").addEventListener("click", () => setTool("quad"));
+document.getElementById("toolPointBtn").addEventListener("click", () => setTool("point"));
+function setTool(tool) {
+  activeTool = tool;
+  document.getElementById("toolQuadBtn").classList.toggle("active", tool === "quad");
+  document.getElementById("toolPointBtn").classList.toggle("active", tool === "point");
+  document.getElementById("bboxHint").innerHTML = tool === "quad"
+    ? "<b>畫框模式</b>：依序點 4 個角，順著物體的角度點（不用是矩形），點完第 4 個角會自動封閉成框。之後可以直接拖曳任一角上的小方塊調整位置。"
+    : "<b>標熱點模式</b>：直接點擊要標記的熱點位置，可能有多個熱點就點多次，每點自動編號。";
+  // reset any in-progress quad when switching tools
+  if (state.bbox.canvasInfo) { state.bbox.drawingCorners = []; redrawBbox(); }
+}
+
+function renderBbox() {
+  const st = state.bbox;
+  const item = st.items[st.current];
+  document.getElementById("bboxName").textContent = item.file;
+  const info = makeBaseCanvas(document.getElementById("bboxWrap"), item.img);
+  st.canvasInfo = info;
+  st.drawingCorners = [];
+  st.draggingHandle = null;
+  st.mousePos = null;
+
+  info.canvas.addEventListener("mousedown", (e) => onBboxMouseDown(e));
+  info.canvas.addEventListener("mousemove", (e) => onBboxMouseMove(e));
+
+  redrawBbox();
+  document.getElementById("undoBboxBtn").disabled = false;
+  document.getElementById("clearBboxBtn").disabled = false;
+}
+
+function findHandleAt(item, info, screenPt) {
+  for (let bi = 0; bi < item.boxes.length; bi++) {
+    const corners = item.boxes[bi].corners;
+    for (let ci = 0; ci < corners.length; ci++) {
+      const cx = corners[ci][0] * info.scale, cy = corners[ci][1] * info.scale;
+      if (Math.hypot(cx - screenPt[0], cy - screenPt[1]) <= HANDLE_HIT_RADIUS) {
+        return { boxIdx: bi, cornerIdx: ci };
+      }
+    }
+  }
+  return null;
+}
+
+function onBboxMouseDown(e) {
+  const st = state.bbox;
+  const info = st.canvasInfo;
+  const item = st.items[st.current];
+  const rect = info.canvas.getBoundingClientRect();
+  const screenPt = [e.clientX - rect.left, e.clientY - rect.top];
+  const imgPt = toImgCoords(info.canvas, info.scale, e);
+
+  if (activeTool === "quad") {
+    const hit = findHandleAt(item, info, screenPt);
+    if (hit) { st.draggingHandle = hit; return; }
+    st.drawingCorners.push(imgPt);
+    if (st.drawingCorners.length === 4) {
+      item.boxes.push({ corners: st.drawingCorners });
+      item.history.push("box");
+      st.drawingCorners = [];
+    }
+    redrawBbox();
+  } else {
+    item.points.push(imgPt);
+    item.history.push("point");
+    redrawBbox();
+  }
+}
+
+function onBboxMouseMove(e) {
+  const st = state.bbox;
+  const info = st.canvasInfo;
+  const item = st.items[st.current];
+  const imgPt = toImgCoords(info.canvas, info.scale, e);
+  st.mousePos = imgPt;
+
+  if (st.draggingHandle) {
+    item.boxes[st.draggingHandle.boxIdx].corners[st.draggingHandle.cornerIdx] = imgPt;
+    redrawBbox();
+  } else if (activeTool === "quad" && st.drawingCorners.length > 0) {
+    redrawBbox();
+  }
+}
+
+window.addEventListener("mouseup", () => {
+  if (mode !== "bbox") return;
+  state.bbox.draggingHandle = null;
+});
+
+function redrawBbox() {
+  const st = state.bbox;
+  const item = st.items[st.current];
+  const info = st.canvasInfo;
+  info.ctx.drawImage(item.img, 0, 0, info.canvas.width, info.canvas.height);
+
+  item.boxes.forEach((b, idx) => {
+    const color = PALETTE[idx % PALETTE.length];
+    info.ctx.strokeStyle = color;
+    info.ctx.lineWidth = 2;
+    info.ctx.beginPath();
+    b.corners.forEach((c, i) => {
+      const x = c[0] * info.scale, y = c[1] * info.scale;
+      if (i === 0) info.ctx.moveTo(x, y); else info.ctx.lineTo(x, y);
+    });
+    info.ctx.closePath();
+    info.ctx.stroke();
+    // corner handles (only actionable in quad tool, but always shown for reference)
+    b.corners.forEach((c) => {
+      const x = c[0] * info.scale, y = c[1] * info.scale;
+      info.ctx.fillStyle = color;
+      info.ctx.fillRect(x - 4, y - 4, 8, 8);
+      info.ctx.strokeStyle = "#0B0E12";
+      info.ctx.lineWidth = 1;
+      info.ctx.strokeRect(x - 4, y - 4, 8, 8);
+    });
+    info.ctx.fillStyle = color;
+    info.ctx.font = "bold 12px sans-serif";
+    info.ctx.fillText(`box#${idx + 1}`, b.corners[0][0] * info.scale + 6, b.corners[0][1] * info.scale - 8);
+  });
+
+  // in-progress quad preview
+  if (activeTool === "quad" && st.drawingCorners.length > 0) {
+    info.ctx.strokeStyle = "#FFFFFF";
+    info.ctx.setLineDash([4, 3]);
+    info.ctx.lineWidth = 1.5;
+    info.ctx.beginPath();
+    st.drawingCorners.forEach((c, i) => {
+      const x = c[0] * info.scale, y = c[1] * info.scale;
+      if (i === 0) info.ctx.moveTo(x, y); else info.ctx.lineTo(x, y);
+    });
+    if (st.mousePos) info.ctx.lineTo(st.mousePos[0] * info.scale, st.mousePos[1] * info.scale);
+    info.ctx.stroke();
+    info.ctx.setLineDash([]);
+    st.drawingCorners.forEach((c) => {
+      info.ctx.fillStyle = "#FFFFFF";
+      info.ctx.beginPath();
+      info.ctx.arc(c[0] * info.scale, c[1] * info.scale, 4, 0, Math.PI * 2);
+      info.ctx.fill();
+    });
+  }
+
+  item.points.forEach((p, idx) => {
+    const color = PALETTE[idx % PALETTE.length];
+    const x = p[0] * info.scale, y = p[1] * info.scale;
+    info.ctx.beginPath();
+    info.ctx.arc(x, y, 6, 0, Math.PI * 2);
+    info.ctx.fillStyle = color;
+    info.ctx.fill();
+    info.ctx.lineWidth = 2;
+    info.ctx.strokeStyle = "#0B0E12";
+    info.ctx.stroke();
+    info.ctx.font = "bold 11px sans-serif";
+    info.ctx.fillStyle = "#0B0E12";
+    info.ctx.textAlign = "center";
+    info.ctx.textBaseline = "middle";
+    info.ctx.fillText(`P${idx + 1}`, x, y - 13);
+  });
+
+  renderBboxList();
+}
+function renderBboxList() {
+  const item = state.bbox.items[state.bbox.current];
+  const el = document.getElementById("bboxList");
+  el.innerHTML = "";
+  item.boxes.forEach((b, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "anno-chip";
+    chip.style.borderColor = PALETTE[idx % PALETTE.length];
+    const cornerTxt = b.corners.map((c) => `(${c[0].toFixed(0)},${c[1].toFixed(0)})`).join(" ");
+    chip.innerHTML = `▱ <span class="n" style="color:${PALETTE[idx % PALETTE.length]}">box#${idx + 1}</span> ${cornerTxt} <span class="rm" data-type="box" data-idx="${idx}">✕</span>`;
+    el.appendChild(chip);
+  });
+  item.points.forEach((p, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "anno-chip";
+    chip.style.borderColor = PALETTE[idx % PALETTE.length];
+    chip.innerHTML = `● <span class="n" style="color:${PALETTE[idx % PALETTE.length]}">P${idx + 1}</span> (${p[0].toFixed(0)}, ${p[1].toFixed(0)}) <span class="rm" data-type="point" data-idx="${idx}">✕</span>`;
+    el.appendChild(chip);
+  });
+  el.querySelectorAll(".rm").forEach((r) => r.addEventListener("click", (e) => {
+    const type = e.target.dataset.type, idx = Number(e.target.dataset.idx);
+    if (type === "box") item.boxes.splice(idx, 1); else item.points.splice(idx, 1);
+    const hIdx = item.history.lastIndexOf(type);
+    if (hIdx !== -1) item.history.splice(hIdx, 1);
+    redrawBbox();
+  }));
+}
+document.getElementById("undoBboxBtn").addEventListener("click", () => {
+  const st = state.bbox;
+  const item = st.items[st.current];
+  if (st.drawingCorners.length > 0) { st.drawingCorners.pop(); redrawBbox(); return; }
+  const last = item.history.pop();
+  if (last === "box") item.boxes.pop();
+  else if (last === "point") item.points.pop();
+  redrawBbox();
+});
+document.getElementById("clearBboxBtn").addEventListener("click", () => {
+  const item = state.bbox.items[state.bbox.current];
+  item.boxes = [];
+  item.points = [];
+  item.history = [];
+  state.bbox.drawingCorners = [];
+  redrawBbox();
+});
+
+
+// ================= PAIR MODE =================
+document.getElementById("loadPairBtn").addEventListener("click", async () => {
+  const ceFiles = Array.from(document.getElementById("ceFiles").files).sort((a, b) => a.name.localeCompare(b.name));
+  const newFiles = Array.from(document.getElementById("newFiles").files).sort((a, b) => a.name.localeCompare(b.name));
+  if (ceFiles.length === 0 || newFiles.length === 0) { alert("請至少各選一張 CE 照片與新照片"); return; }
+  if (ceFiles.length !== newFiles.length) {
+    if (!confirm(`CE 照片有 ${ceFiles.length} 張，新照片有 ${newFiles.length} 張，數量不一致。將依檔名排序後配對前 ${Math.min(ceFiles.length, newFiles.length)} 組，確定要繼續嗎？`)) return;
+  }
+  const n = Math.min(ceFiles.length, newFiles.length);
+  const items = [];
+  for (let i = 0; i < n; i++) {
+    const ceImg = await loadImage(ceFiles[i]);
+    const newImg = await loadImage(newFiles[i]);
+    items.push({ ceFile: ceFiles[i].name, newFile: newFiles[i].name, ceImg, newImg, points: [] });
+  }
+  state.pair.items = items;
+  state.pair.current = 0;
+  state.pair.pendingCe = null;
+  document.getElementById("exportPairBtn").disabled = false;
+  renderCurrent();
+  refreshNavBar();
+});
+
+function renderPair() {
+  const st = state.pair;
+  const pair = st.items[st.current];
+  document.getElementById("ceName").textContent = pair.ceFile;
+  document.getElementById("newName").textContent = pair.newFile;
+  st.pendingCe = null;
+  st.ceInfo = makeBaseCanvas(document.getElementById("ceWrap"), pair.ceImg);
+  st.newInfo = makeBaseCanvas(document.getElementById("newWrap"), pair.newImg);
+  st.ceInfo.canvas.addEventListener("click", (e) => {
+    st.pendingCe = toImgCoords(st.ceInfo.canvas, st.ceInfo.scale, e);
+    redrawPair();
+  });
+  st.newInfo.canvas.addEventListener("click", (e) => {
+    if (!st.pendingCe) return;
+    const pt = toImgCoords(st.newInfo.canvas, st.newInfo.scale, e);
+    pair.points.push({ ce: st.pendingCe, new: pt });
+    st.pendingCe = null;
+    redrawPair();
+
+    const autoAdvance = document.getElementById("autoAdvance").checked;
+    if (autoAdvance) {
+      if (st.current < st.items.length - 1) {
+        showToast("✓ 這組完成，已自動跳到下一組");
+        setTimeout(() => { st.current++; renderCurrent(); refreshNavBar(); }, 350);
+      } else {
+        showToast("✓ 這組完成！這是最後一組了，可以匯出 JSON 了");
+      }
+    }
+  });
+  redrawPair();
+  document.getElementById("undoPairBtn").disabled = false;
+  document.getElementById("clearPairBtn").disabled = false;
+}
+function redrawPair() {
+  const st = state.pair;
+  const pair = st.items[st.current];
+  st.ceInfo.ctx.drawImage(pair.ceImg, 0, 0, st.ceInfo.canvas.width, st.ceInfo.canvas.height);
+  st.newInfo.ctx.drawImage(pair.newImg, 0, 0, st.newInfo.canvas.width, st.newInfo.canvas.height);
+  pair.points.forEach((p, idx) => {
+    const color = PALETTE[idx % PALETTE.length];
+    drawMarker(st.ceInfo, p.ce, color, idx + 1);
+    drawMarker(st.newInfo, p.new, color, idx + 1);
+  });
+  if (st.pendingCe) drawMarker(st.ceInfo, st.pendingCe, "#FFFFFF", pair.points.length + 1, true);
+  renderPairList();
+}
+function drawMarker(info, pt, color, label, pending = false) {
+  const x = pt[0] * info.scale, y = pt[1] * info.scale;
+  info.ctx.beginPath();
+  info.ctx.arc(x, y, 6, 0, Math.PI * 2);
+  info.ctx.fillStyle = pending ? "rgba(255,255,255,0.25)" : color;
+  info.ctx.fill();
+  info.ctx.lineWidth = 2;
+  info.ctx.strokeStyle = "#0B0E12";
+  info.ctx.stroke();
+  info.ctx.font = "bold 11px sans-serif";
+  info.ctx.fillStyle = "#0B0E12";
+  info.ctx.textAlign = "center";
+  info.ctx.textBaseline = "middle";
+  info.ctx.fillText(label, x, y - 12);
+}
+function renderPairList() {
+  const pair = state.pair.items[state.pair.current];
+  const el = document.getElementById("pairList");
+  el.innerHTML = "";
+  pair.points.forEach((p, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "anno-chip";
+    chip.style.borderColor = PALETTE[idx % PALETTE.length];
+    chip.innerHTML = `<span class="n" style="color:${PALETTE[idx % PALETTE.length]}">#${idx + 1}</span> CE(${p.ce[0].toFixed(0)},${p.ce[1].toFixed(0)}) → 新(${p.new[0].toFixed(0)},${p.new[1].toFixed(0)}) <span class="rm" data-idx="${idx}">✕</span>`;
+    el.appendChild(chip);
+  });
+  el.querySelectorAll(".rm").forEach((r) => r.addEventListener("click", (e) => {
+    pair.points.splice(Number(e.target.dataset.idx), 1);
+    redrawPair();
+  }));
+}
+document.getElementById("undoPairBtn").addEventListener("click", () => {
+  const st = state.pair;
+  if (st.pendingCe) st.pendingCe = null;
+  else st.items[st.current].points.pop();
+  redrawPair();
+});
+document.getElementById("clearPairBtn").addEventListener("click", () => {
+  state.pair.items[state.pair.current].points = [];
+  state.pair.pendingCe = null;
+  redrawPair();
+});
+
+// ================= RENDER DISPATCH =================
+function renderCurrent() {
+  if (mode === "bbox") { if (state.bbox.items.length) renderBbox(); }
+  else { if (state.pair.items.length) renderPair(); }
+  refreshNavBar();
+}
+
+// ================= EXPORTS =================
+document.getElementById("exportSingleBtn").addEventListener("click", async () => {
+  const zip = new JSZip();
+  const className = document.getElementById("className").value.trim() || "object";
+  zip.file("classes.txt", className);
+
+  const obbFolder = zip.folder("yolo_obb_labels");     // true 4-corner quad (YOLO-OBB format), kept as supplementary reference
+  const flatLabelsFolder = zip.folder("yolo_labels");  // always included
+  const testImages = zip.folder("test/images");
+  const testLabels = zip.folder("test/labels");
+  const hotspotData = [];
+
+  state.bbox.items.forEach((item) => {
+    const w = item.img.naturalWidth, h = item.img.naturalHeight;
+    const base = item.file.replace(/\.[^.]+$/, "");
+
+    const bboxLines = item.boxes.map((b) => {
+      const xs = b.corners.map((c) => c[0]), ys = b.corners.map((c) => c[1]);
+      const x1 = Math.min(...xs), x2 = Math.max(...xs);
+      const y1 = Math.min(...ys), y2 = Math.max(...ys);
+      const xc = ((x1 + x2) / 2 / w).toFixed(6);
+      const yc = ((y1 + y2) / 2 / h).toFixed(6);
+      const bw = ((x2 - x1) / w).toFixed(6);
+      const bh = ((y2 - y1) / h).toFixed(6);
+      return `0 ${xc} ${yc} ${bw} ${bh}`;
+    }).join("\n");
+
+    flatLabelsFolder.file(base + ".txt", bboxLines);
+    testLabels.file(base + ".txt", bboxLines);
+    testImages.file(item.file, item.fileObj);
+
+    const obbLines = item.boxes.map((b) => {
+      const coords = b.corners.map((c) => `${(c[0] / w).toFixed(6)} ${(c[1] / h).toFixed(6)}`).join(" ");
+      return `0 ${coords}`;
+    }).join("\n");
+    obbFolder.file(base + ".txt", obbLines);
+
+    hotspotData.push({
+      file: item.file,
+      points: item.points.map((p) => [Math.round(p[0]), Math.round(p[1])]),
+    });
+  });
+
+  zip.file("hotspot_points.json", JSON.stringify(hotspotData, null, 2));
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob(blob, "annotations_bbox_and_hotspots.zip");
+  showToast(`✓ 已匯出：test/ 資料夾（共 ${state.bbox.items.length} 張）＋ yolo_labels/ ＋ yolo_obb_labels/ ＋ hotspot_points.json`);
+});
+
+document.getElementById("exportPairBtn").addEventListener("click", () => {
+  const data = state.pair.items.map((p) => ({
+    ce_file: p.ceFile,
+    new_file: p.newFile,
+    points: p.points.map((pt) => ({ ce: [Math.round(pt.ce[0]), Math.round(pt.ce[1])], new: [Math.round(pt.new[0]), Math.round(pt.new[1])] })),
+  }));
+  downloadJson(data, "point_correspondences.json");
+});
+
+function downloadJson(data, filename) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  downloadBlob(blob, filename);
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>

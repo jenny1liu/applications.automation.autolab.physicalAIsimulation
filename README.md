@@ -33,6 +33,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+If you only need the synthetic generator workflow (without runtime UI and model inference stack),
+you can install the lighter dependency set:
+
+```bash
+pip install -r thermal_dataset_generator/requirements.txt
+```
+
 ### 2. Generate OpenVINO model once
 
 thermal/yolov8n.pt is in-repo. Export OpenVINO IR locally:
@@ -138,11 +145,22 @@ python -m unittest discover -s tests -p "test_robot_action_layer.py" -v
 - Action layer implementation is in robot/action_layer.py.
 - Robot UI demo is in robot/ui.py.
 
+### Standalone Annotation Tool
+
+- `annotator/all_in_one_annotator.html` is a standalone browser-based annotation utility.
+- It is intentionally separate from `thermal_dataset_generator/` because it serves a different workflow.
+- Open it directly in a browser (double-click, or drag into browser) when you need manual annotation.
+
 ## Requirements
 
 - Python 3.9+
 - Optional GPU for faster PyTorch inference
 - OpenVINO runtime for optimized CPU inference
+
+### Dependency Files
+
+- `requirements.txt`: full project stack (thermal runtime UI, detectors, OpenVINO, robot extras).
+- `thermal_dataset_generator/requirements.txt`: minimal generator-only stack for dataset pipeline tasks.
 
 ## Notes
 
