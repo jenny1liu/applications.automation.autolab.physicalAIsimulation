@@ -654,6 +654,8 @@ class ThermalHotspotDemo:
         }
         self._img_figs: dict[str, Figure] = {}
         self._img_cvs: dict[str, FigureCanvasTkAgg] = {}
+        self._img_canvas_size: dict[str, tuple[int, int]] = {}  # true (w, h) from Configure
+        self._resize_jobs: dict[str, str] = {}  # debounce ids for redraw-on-resize
         self._card_title_vars: dict[str, tk.StringVar] = {}
         self._sub_vars: dict[str, tk.StringVar] = {}
         self._kpi_acc_labels: dict[str, tk.Label] = {}
@@ -729,9 +731,9 @@ class ThermalHotspotDemo:
         # Keep margins for taskbar/window chrome to avoid off-screen bottom overflow.
         max_w = max(860, screen_w - 12)
         max_h = max(540, screen_h - 12)
-        # Minimum width increased to accommodate 3 enlarged thermal image cards (420px each column)
-        min_w = min(2000, max(1200, int(screen_w * 0.75)))
-        min_h = min(700, max(520, int(screen_h * 0.62)))
+        # Adaptive minimum: works on 1366x768 and high-DPI (125%+) screens
+        min_w = min(1800, max(960, int(screen_w * 0.68)))
+        min_h = min(680, max(480, int(screen_h * 0.60)))
 
         state = self._load_ui_state()
         restored = False
@@ -1555,9 +1557,9 @@ class ThermalHotspotDemo:
     def _build_vis_and_metrics(self, parent: tk.Frame) -> None:
         self._vis_frame = tk.Frame(parent, bg=C["bg"])
         self._vis_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        # Configure columns with adequate minimum width to display thermal figures
-        # 4.8 inches * 80 dpi + card padding = 420 pixels minimum per column
-        min_col_width = 420
+        # Adaptive column minimum: figures now resize via <Configure>, so a small
+        # minsize is sufficient. 3 × 150 = 450px vis_frame minimum fits any window.
+        min_col_width = 150
         for col in (0, 1, 2):
             self._vis_frame.columnconfigure(col, weight=1, minsize=min_col_width)
         # Give the top row (thermal + reference cards) slightly more height.
@@ -1566,7 +1568,7 @@ class ThermalHotspotDemo:
 
         right = tk.Frame(parent, bg=C["surface"],
                           highlightbackground=C["border"],
-                          highlightthickness=1, width=268)
+                          highlightthickness=1, width=260)
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_propagate(False)
         right.columnconfigure(0, weight=1)
@@ -1659,8 +1661,8 @@ class ThermalHotspotDemo:
         card.rowconfigure(0, weight=0)  # title bar - no expansion
         card.rowconfigure(1, weight=1)  # Canvas - expand to fill available space
         if key in ("opencv", "pytorch", "openvino"):
-            card.rowconfigure(2, weight=0, minsize=172)  # metric panel - fixed height
-            card.rowconfigure(3, weight=0, minsize=58)   # robot target - fixed height
+            card.rowconfigure(2, weight=0, minsize=140)  # metric panel - fixed height
+            card.rowconfigure(3, weight=0, minsize=44)   # robot target - fixed height
 
         tbar = tk.Frame(card, bg=C["card"])
         tbar.grid(row=0, column=0, sticky="ew")
@@ -1674,8 +1676,8 @@ class ThermalHotspotDemo:
         tk.Label(tbar, textvariable=sub, bg=C["card"], fg=C["muted"],
                  font=(FF, 8)).pack(side=tk.RIGHT, padx=8)
 
-        fig_h = 5.0 if key == "thermal" else 4.35
-        fig_w = 8.6 if key == "thermal" else 7.9
+        fig_h = 3.0
+        fig_w = 4.0
         fig = Figure(figsize=(fig_w, fig_h), dpi=80)
         fig.patch.set_facecolor(C["card"])
         ax = fig.add_subplot(111)
@@ -1685,15 +1687,55 @@ class ThermalHotspotDemo:
         ax.axis("off")
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
-        fig.subplots_adjust(left=0.10, right=0.77,
-                    bottom=0.04, top=0.955)
 
-        cv = FigureCanvasTkAgg(fig, master=card)
-        # Configure Canvas to fill available space - let grid system manage sizing
-        # Figsize (8.0x4.5 @80dpi = 640x360px) is fixed; Canvas scales display based on parent container
-        cv.get_tk_widget().configure(bg=C["card"], highlightthickness=0)
-        cv.get_tk_widget().grid(row=1, column=0, sticky="nsew",
+        # Wrap the canvas in a plain holder frame. FigureCanvasTkAgg.blit()/draw()
+        # calls configure(width/height) on the canvas widget, locking its reported
+        # geometry to the figure's last-rendered pixel size — so binding <Configure>
+        # to the canvas yields stale, too-narrow sizes on wide cards. The holder is a
+        # normal grid-controlled frame whose size always reflects the true cell
+        # allocation, so we measure it instead. The canvas fills the holder via sticky.
+        holder = tk.Frame(card, bg=C["card"])
+        holder.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 0))
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        cv = FigureCanvasTkAgg(fig, master=holder)
+        # Override the fixed width/height that FigureCanvasTkAgg sets on the widget so the
+        # grid manager can shrink the cell below the figure's natural pixel size.
+        cv.get_tk_widget().configure(bg=C["card"], highlightthickness=0, width=1, height=1)
+        cv.get_tk_widget().grid(row=0, column=0, sticky="nsew",
                                  padx=0, pady=(0, 0))
+
+        def _on_fig_resize(event, _fig=fig, _cv=cv, _key=key):
+            w, h = event.width, event.height
+            if w < 4 or h < 4:
+                return
+            # Record the TRUE grid-allocated cell size from the holder frame (which is
+            # never blit-locked, unlike the canvas widget). _draw() reads this to size
+            # the figure so the image fills the whole card, including wide colspan cards.
+            self._img_canvas_size[_key] = (int(w), int(h))
+            dpi = _fig.get_dpi()
+            cur_w, cur_h = _fig.get_size_inches()
+            new_w, new_h = w / dpi, h / dpi
+            # Do NOT call draw_idle() here — it would trigger blit → configure(W) →
+            # new Configure event, snowballing the figure size on wide cards.
+            if abs(new_w - cur_w) * dpi > 1 or abs(new_h - cur_h) * dpi > 1:
+                _fig.set_size_inches(new_w, new_h, forward=False)
+                # Redraw (debounced) so the Agg bitmap matches the new canvas size.
+                # Without this the bitmap keeps its last-drawn width while the widget
+                # stretches to fill a wider cell (e.g. the colspan=2 baseline card),
+                # leaving a blank strip on the right. The debounce coalesces the burst
+                # of resize events during a window drag and lets the geometry settle
+                # before a single redraw, which avoids the size-cascade.
+                old_job = self._resize_jobs.get(_key)
+                if old_job is not None:
+                    try:
+                        self.root.after_cancel(old_job)
+                    except Exception:
+                        pass
+                self._resize_jobs[_key] = self.root.after(
+                    80, lambda _c=_cv, _k=_key: self._redraw_after_resize(_k, _c))
+
+        holder.bind("<Configure>", _on_fig_resize)
         cv.draw()
         self._img_figs[key] = fig
         self._img_cvs[key] = cv
@@ -1703,8 +1745,8 @@ class ThermalHotspotDemo:
             metric_panel.grid(row=2, column=0, sticky="ew", padx=2, pady=(0, 2))
             metric_panel.columnconfigure(0, weight=1)
             metric_panel.columnconfigure(1, weight=1)
-            metric_panel.rowconfigure(0, weight=1, minsize=82)
-            metric_panel.rowconfigure(1, weight=1, minsize=82)
+            metric_panel.rowconfigure(0, weight=1, minsize=65)
+            metric_panel.rowconfigure(1, weight=1, minsize=65)
 
             for idx, (title_txt, unit, key_suffix, value_size) in enumerate([
                 ("Position Error", "px", "acc", 16),
@@ -1721,42 +1763,41 @@ class ThermalHotspotDemo:
                           pady=(0 if rr == 0 else 3, 0))
 
                 tk.Label(cell, text=title_txt, bg="#1B1F33", fg=C["muted"],
-                         font=(FF, 12, "normal")).pack(anchor=tk.W, padx=6, pady=(5, 0))
+                         font=(FF, 9, "normal")).pack(anchor=tk.W, padx=6, pady=(4, 0))
                 vrow = tk.Frame(cell, bg="#1B1F33")
-                vrow.pack(anchor=tk.W, padx=6, pady=(2, 5))
+                vrow.pack(anchor=tk.W, padx=6, pady=(2, 4))
                 valLabel = tk.Label(vrow, textvariable=self._kpi[f"{key}_{key_suffix}"],
                          bg="#1B1F33", fg=C["text"],
-                         font=(FF, value_size, "bold"))
+                         font=(FF, 13, "bold"))
                 valLabel.pack(side=tk.LEFT)
                 if key_suffix == "acc":
                     self._kpi_acc_labels[key] = valLabel
                 tk.Label(vrow, text=f" {unit}", bg="#1B1F33", fg=C["text"],
-                         font=(FF, 12)).pack(side=tk.LEFT, pady=(0, 1))
+                         font=(FF, 9)).pack(side=tk.LEFT, pady=(0, 1))
 
             # Robot target position row — single-line display below the 4 KPI cells.
             xyz_row = tk.Frame(card, bg="#161929",
                                highlightbackground=C["accent"], highlightthickness=1)
             xyz_row.grid(row=3, column=0, sticky="ew", padx=2, pady=(1, 2))
-            tk.Label(xyz_row, text="⬡ Robot Target (XYZ)", bg="#161929", fg=C["sidebar_accent"],
-                     font=(FF, 12, "bold")).pack(side=tk.LEFT, padx=(8, 8), pady=5)
+            tk.Label(xyz_row, text="⬡ XY", bg="#161929", fg=C["sidebar_accent"],
+                     font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=(6, 4), pady=4)
             _badge_center = tk.Frame(xyz_row, bg="#161929")
             _badge_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
             _badge_holder = tk.Frame(_badge_center, bg="#161929")
-            _badge_holder.pack(anchor=tk.CENTER, pady=5)
+            _badge_holder.pack(anchor=tk.CENTER, pady=4)
             for axisLabel, axisVar in [
                 ("X:", self._robot_x_vars[key]),
                 ("Y:", self._robot_y_vars[key]),
-                ("Z:", self._robot_z_vars[key]),
             ]:
                 badge = tk.Frame(_badge_holder, bg="#252B44",
                                  highlightbackground=C["border"], highlightthickness=1)
                 badge.pack(side=tk.LEFT, padx=(0, 4))
                 tk.Label(badge, text=axisLabel, bg="#252B44", fg=C["muted"],
-                         font=(FF, 12, "bold")).pack(side=tk.LEFT, padx=(4, 1), pady=2)
+                         font=(FF, 9, "bold")).pack(side=tk.LEFT, padx=(4, 1), pady=2)
                 tk.Label(badge, textvariable=axisVar, bg="#252B44", fg=C["text"],
-                         font=("Consolas", 14, "bold")).pack(side=tk.LEFT, padx=(0, 4), pady=2)
+                         font=("Consolas", 11, "bold")).pack(side=tk.LEFT, padx=(0, 4), pady=2)
             tk.Label(xyz_row, text="(m)", bg="#161929", fg=C["muted"],
-                     font=(FF, 12)).pack(side=tk.LEFT, padx=(2, 8), pady=5)
+                     font=(FF, 9)).pack(side=tk.LEFT, padx=(2, 8), pady=4)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1921,12 +1962,39 @@ class ThermalHotspotDemo:
         range_high = max(range_high, range_low + 6.0)
         return range_low, range_high
 
+    def _redraw_after_resize(self, key: str, cv) -> None:
+        """Re-render the Agg bitmap so it fills the newly resized canvas widget.
+
+        Called (debounced) from the <Configure> handler. The figure size was already
+        set to the canvas size; a plain draw_idle() re-renders the existing axes
+        content at that size so no blank margin remains on wider cards.
+        """
+        self._resize_jobs.pop(key, None)
+        try:
+            cv.draw_idle()
+        except Exception:
+            pass
+
     def _draw(self, key: str, image: np.ndarray,
                cmap: str = "inferno",
                centers=None, result=None,
                subtitle: str = "") -> None:
         fig = self._img_figs[key]
         cv  = self._img_cvs[key]
+        # Size the figure to the true grid-allocated canvas size captured by the
+        # <Configure> handler. This exactly matches the row-1 cell the grid gave the
+        # canvas — no hardcoded title-bar guess, so the image fills the card fully.
+        try:
+            size = self._img_canvas_size.get(key)
+            if size is None:
+                widget = cv.get_tk_widget()
+                size = (widget.winfo_width(), widget.winfo_height())
+            w, h = size
+            if w > 10 and h > 10:
+                dpi = fig.get_dpi()
+                fig.set_size_inches(w / dpi, h / dpi, forward=False)
+        except Exception:
+            pass
         fig.clear()
         ax = fig.add_subplot(111)
         ax.set_facecolor("#161929")
@@ -1941,7 +2009,7 @@ class ThermalHotspotDemo:
         
         # Use custom thermal colormap with dynamic normalization
         dynamic_norm = Normalize(vmin=temp_min, vmax=temp_max)
-        imshow_kwargs = {"aspect": "equal", "alpha": 1.0, "zorder": 2}
+        imshow_kwargs = {"aspect": "auto", "alpha": 1.0, "zorder": 2}
         imshow_kwargs["cmap"] = self.thermal_cmap
         imshow_kwargs["norm"] = dynamic_norm
         
@@ -1950,16 +2018,6 @@ class ThermalHotspotDemo:
         if key in ("thermal", "opencv", "pytorch", "openvino"):
             # Keep all model cards on the same geometric reference and keyboard guide.
             self._draw_keyboard_c_deck_reference(ax, image.shape)
-            
-            # Add colorbar on the right side with same height as image
-            # thermal uses smaller pad, model cards use standard pad
-            colorbar_pad = 0.025 if key == "thermal" else 0.05
-            cbar = fig.colorbar(im, ax=ax, orientation="vertical", pad=colorbar_pad, fraction=0.035, shrink=1.00)
-            cbar.set_label("Temperature (°C)", color=C["text"], fontsize=8, labelpad=12)
-            cbar.ax.tick_params(colors=C["text"], labelsize=7)
-            cbar.outline.set_edgecolor(C["border"])
-            for spine in cbar.ax.spines.values():
-                spine.set_edgecolor(C["border"])
         
         if centers:
             r   = 2.0   # circle radius in data coords (pixels)
@@ -2031,10 +2089,8 @@ class ThermalHotspotDemo:
         for spine in ax.spines.values():
             spine.set_edgecolor(C["border"])
         ax.axis("off")
-        # Keep thermal card margins controlled by the initial card setup.
-        if key != "thermal":
-            fig.subplots_adjust(left=0.10, right=0.90,
-                                bottom=0.04, top=0.955)
+        # Fill the entire figure — inset colorbar needs no external margin.
+        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
         cv.draw()
         self._sub_vars[key].set(subtitle)
 
@@ -2561,7 +2617,6 @@ class ThermalHotspotDemo:
         ax.text(0.5, 0.5, "Single Run", ha="center", va="center",
                 color=C["dim"], fontsize=9, transform=ax.transAxes)
         ax.axis("off")
-        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
         cv.draw()
         self._sub_vars[key].set("—")
         if key in self._kpi_acc_labels:
@@ -2861,6 +2916,9 @@ class ThermalHotspotDemo:
                 summaryByModel[key]["executionDeviceText"] = self.yolo_openvino_detector.get_execution_device_text()  # type: ignore[index]
 
         bestError = min((v["errorMean"] for v in summaryByModel.values()), default=float("inf"))
+        bestLatency = min((v["latencyMean"] for v in summaryByModel.values()), default=float("inf"))
+        bestFps = max((v["fpsMean"] for v in summaryByModel.values()), default=float("-inf"))
+        bestConfidence = max((v["confidenceMean"] for v in summaryByModel.values()), default=float("-inf"))
         metricLabelWidth = 16
         metricValueWidth = 8
         metricUnitWidth = 3
@@ -2878,6 +2936,9 @@ class ThermalHotspotDemo:
             s = summaryByModel[key]
             errorMean = float(s["errorMean"])
             isBest = abs(errorMean - bestError) < 0.01
+            isBestLatency = abs(float(s["latencyMean"]) - bestLatency) < 0.01
+            isBestFps = abs(float(s["fpsMean"]) - bestFps) < 0.05
+            isBestConfidence = abs(float(s["confidenceMean"]) - bestConfidence) < 0.05
             tagged += [
                 ("key", f"{MODEL_DISPLAY_NAMES[key].upper()}\n"),
             ]
@@ -2892,17 +2953,17 @@ class ThermalHotspotDemo:
                 ("good" if isBest else "warn", f"    {'Median (P50)':<{metricLabelWidth}}{s['errorMedian']:>{metricValueWidth}.2f} {'px':<{metricUnitWidth}}\n"),
                 ("good" if isBest else "warn", f"    {'P95':<{metricLabelWidth}}{s['errorP95']:>{metricValueWidth}.2f} {'px':<{metricUnitWidth}}\n"),
                 ("muted", "  Processing Time:\n"),
-                ("val", f"    {'mean':<{metricLabelWidth}}{s['latencyMean']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
-                ("val", f"    {'Median (P50)':<{metricLabelWidth}}{s['latencyMedian']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
-                ("val", f"    {'P95':<{metricLabelWidth}}{s['latencyP95']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
+                ("good" if isBestLatency else "val", f"    {'mean':<{metricLabelWidth}}{s['latencyMean']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
+                ("good" if isBestLatency else "val", f"    {'Median (P50)':<{metricLabelWidth}}{s['latencyMedian']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
+                ("good" if isBestLatency else "val", f"    {'P95':<{metricLabelWidth}}{s['latencyP95']:>{metricValueWidth}.2f} {'ms':<{metricUnitWidth}}\n"),
                 ("muted", "  Frame Rate:\n"),
-                ("val", f"    {'mean':<{metricLabelWidth}}{s['fpsMean']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
-                ("val", f"    {'Median (P50)':<{metricLabelWidth}}{s['fpsMedian']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
-                ("val", f"    {'P95':<{metricLabelWidth}}{s['fpsP95']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
+                ("good" if isBestFps else "val", f"    {'mean':<{metricLabelWidth}}{s['fpsMean']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
+                ("good" if isBestFps else "val", f"    {'Median (P50)':<{metricLabelWidth}}{s['fpsMedian']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
+                ("good" if isBestFps else "val", f"    {'P95':<{metricLabelWidth}}{s['fpsP95']:>{metricValueWidth}.1f} {'fps':<{metricUnitWidth}}\n"),
                 ("muted", "  Confidence Score:\n"),
-                ("val", f"    {'mean':<{metricLabelWidth}}{s['confidenceMean']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
-                ("val", f"    {'Median (P50)':<{metricLabelWidth}}{s['confidenceMedian']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
-                ("val", f"    {'P95':<{metricLabelWidth}}{s['confidenceP95']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n\n"),
+                ("good" if isBestConfidence else "val", f"    {'mean':<{metricLabelWidth}}{s['confidenceMean']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
+                ("good" if isBestConfidence else "val", f"    {'Median (P50)':<{metricLabelWidth}}{s['confidenceMedian']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n"),
+                ("good" if isBestConfidence else "val", f"    {'P95':<{metricLabelWidth}}{s['confidenceP95']:>{metricValueWidth}.1f} {'%':<{metricUnitWidth}}\n\n"),
             ]
         return tagged
 
