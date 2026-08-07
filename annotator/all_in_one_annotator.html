@@ -147,6 +147,7 @@
 <body>
 
 <div class="toast" id="toast"></div>
+<input type="file" id="sessionFileInput" accept="application/json,.json" style="display:none;">
 
 <header>
   <div class="title-row">
@@ -171,6 +172,8 @@
   </div>
   <button class="primary" id="loadSingleBtn">批次載入</button>
   <div class="spacer" style="flex:1"></div>
+  <button id="saveSingleBtn" disabled>儲存進度</button>
+  <button id="loadSingleSessionBtn">載入暫存檔</button>
   <button id="exportSingleBtn" disabled>匯出 ZIP（框＋熱點）</button>
 </div>
 
@@ -190,6 +193,8 @@
     <label style="text-transform:none; font-size:13px; color:var(--text);">每組標 1 個點，完成後自動跳下一組</label>
   </div>
   <div class="spacer" style="flex:1"></div>
+  <button id="savePairBtn" disabled>儲存進度</button>
+  <button id="loadPairSessionBtn">載入暫存檔</button>
   <button id="exportPairBtn" disabled>匯出 JSON</button>
 </div>
 
@@ -246,7 +251,16 @@
 
 <script>
 const PALETTE = ["#E9A23B", "#3FB8AF", "#8E7CC3", "#E0654A", "#6FCF97", "#56A8E8", "#D998C6", "#C9A227"];
+const STORAGE_KEYS = {
+  bbox: "annotator.autosave.bbox.v1",
+  pair: "annotator.autosave.pair.v1",
+};
+const AUTO_SAVE_DELAY_MS = 900;
 let mode = "bbox";
+let activeSessionLoadMode = null;
+let hasUnsavedChanges = false;
+let autoSaveTimer = null;
+let autoRestorePromptShown = false;
 
 // ---- shared state per mode ----
 const state = {
@@ -263,24 +277,175 @@ function showToast(msg) {
 }
 
 function loadImage(file) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.src = URL.createObjectURL(file);
+    if (typeof file === "string") {
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Failed to load saved image data"));
+      img.src = file;
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error(`Failed to load image: ${file.name || "unknown"}`));
+    };
+    img.src = objectUrl;
   });
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name || "unknown"}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToFile(dataUrl, filename) {
+  const parts = dataUrl.split(",");
+  if (parts.length < 2) throw new Error(`Invalid saved image data for ${filename}`);
+  const mimeMatch = parts[0].match(/data:(.*?);base64/);
+  const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+  const binary = atob(parts[1]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], filename, { type: mimeType });
+}
+
+function normalizePoint(point) {
+  if (!Array.isArray(point) || point.length !== 2) return null;
+  const x = Number(point[0]);
+  const y = Number(point[1]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return [x, y];
+}
+
+function normalizeBox(box) {
+  if (!box || !Array.isArray(box.corners) || box.corners.length !== 4) return null;
+  const corners = box.corners.map(normalizePoint);
+  if (corners.some((corner) => !corner)) return null;
+  return { corners };
+}
+
+function sanitizeFilePart(value) {
+  return String(value || "session")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 30) || "session";
+}
+
+function createTimestampString() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function createSessionFilename(sessionMode) {
+  const stamp = createTimestampString();
+  if (sessionMode === "bbox") {
+    const firstFile = state.bbox.items[0]?.file;
+    const prefix = firstFile ? sanitizeFilePart(firstFile) : "bbox_annotations";
+    return `${prefix}_bbox_session_${stamp}.json`;
+  }
+  const firstPair = state.pair.items[0];
+  const prefix = firstPair ? `${sanitizeFilePart(firstPair.ceFile)}_to_${sanitizeFilePart(firstPair.newFile)}` : "point_pairs";
+  return `${prefix}_pair_session_${stamp}.json`;
+}
+
+function updateDirtyState(isDirty) {
+  hasUnsavedChanges = isDirty;
+}
+
+function readAutoSavedPayload(sessionMode) {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEYS[sessionMode]);
+    return raw ? JSON.parse(raw) : null;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+function clearAutoSavedPayload(sessionMode) {
+  try {
+    window.localStorage.removeItem(STORAGE_KEYS[sessionMode]);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function maybeOfferAutoRestore() {
+  if (autoRestorePromptShown) return;
+  autoRestorePromptShown = true;
+  const bboxPayload = readAutoSavedPayload("bbox");
+  const pairPayload = readAutoSavedPayload("pair");
+  const candidate = [bboxPayload, pairPayload]
+    .filter((payload) => payload && payload.savedAt)
+    .sort((left, right) => new Date(right.savedAt).getTime() - new Date(left.savedAt).getTime())[0];
+
+  if (!candidate) return;
+
+  const modeLabel = candidate.mode === "bbox" ? "框選／熱點" : "對應點";
+  const savedAt = new Date(candidate.savedAt);
+  const timeLabel = Number.isNaN(savedAt.getTime()) ? "未知時間" : savedAt.toLocaleString("zh-TW");
+  if (!confirm(`偵測到瀏覽器內有 ${modeLabel} 自動暫存（${timeLabel}）。要立即還原嗎？`)) {
+    return;
+  }
+
+  restoreSessionPayload(candidate, { skipOverwriteConfirm: true, source: "browser" }).catch((error) => {
+    console.error(error);
+    alert(`還原瀏覽器暫存失敗：${error.message}`);
+  });
+}
+
+function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(async () => {
+    const sessionMode = state.pair.items.length > 0 && mode === "pair" ? "pair" : (state.bbox.items.length > 0 ? "bbox" : null);
+    if (!sessionMode) return;
+    try {
+      const payload = sessionMode === "bbox"
+        ? await buildBboxSessionPayload()
+        : await buildPairSessionPayload();
+      window.localStorage.setItem(STORAGE_KEYS[sessionMode], JSON.stringify(payload));
+      updateDirtyState(false);
+      showToast(`✓ 已自動暫存到瀏覽器${sessionMode === "bbox" ? "（框選／熱點）" : "（對應點）"}`);
+    } catch (error) {
+      console.error(error);
+      updateDirtyState(true);
+      showToast("自動暫存失敗，請手動儲存進度檔");
+    }
+  }, AUTO_SAVE_DELAY_MS);
+}
+
+function markSessionChanged() {
+  updateDirtyState(true);
+  scheduleAutoSave();
+}
+
+function setMode(nextMode) {
+  mode = nextMode;
+  document.querySelectorAll(".tab").forEach((btn) => btn.classList.toggle("active", btn.dataset.mode === nextMode));
+  document.getElementById("setup-single").classList.toggle("active", mode === "bbox");
+  document.getElementById("setup-pair").classList.toggle("active", mode === "pair");
+  document.getElementById("stage-bbox").classList.toggle("active", mode === "bbox");
+  document.getElementById("stage-pair").classList.toggle("active", mode === "pair");
+  refreshNavBar();
 }
 
 // ================= TAB SWITCHING =================
 document.querySelectorAll(".tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    mode = btn.dataset.mode;
-    document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b === btn));
-    document.getElementById("setup-single").classList.toggle("active", mode === "bbox");
-    document.getElementById("setup-pair").classList.toggle("active", mode === "pair");
-    document.getElementById("stage-bbox").classList.toggle("active", mode === "bbox");
-    document.getElementById("stage-pair").classList.toggle("active", mode === "pair");
-    refreshNavBar();
-  });
+  btn.addEventListener("click", () => setMode(btn.dataset.mode));
 });
 
 function currentModeState() { return state[mode]; }
@@ -338,16 +503,23 @@ function toImgCoords(canvas, scale, e) {
 document.getElementById("loadSingleBtn").addEventListener("click", async () => {
   const files = Array.from(document.getElementById("singleFiles").files).sort((a, b) => a.name.localeCompare(b.name));
   if (files.length === 0) { alert("請選擇至少一張照片"); return; }
-  const items = [];
-  for (const f of files) {
-    const img = await loadImage(f);
-    items.push({ file: f.name, fileObj: f, img, boxes: [], points: [], history: [] });
+  try {
+    const items = [];
+    for (const file of files) {
+      const img = await loadImage(file);
+      items.push({ file: file.name, fileObj: file, img, boxes: [], points: [], history: [] });
+    }
+    state.bbox.items = items;
+    state.bbox.current = 0;
+    document.getElementById("saveSingleBtn").disabled = false;
+    document.getElementById("exportSingleBtn").disabled = false;
+    renderCurrent();
+    refreshNavBar();
+    markSessionChanged();
+  } catch (error) {
+    console.error(error);
+    alert(`載入照片失敗：${error.message}`);
   }
-  state.bbox.items = items;
-  state.bbox.current = 0;
-  document.getElementById("exportSingleBtn").disabled = false;
-  renderCurrent();
-  refreshNavBar();
 });
 
 const HANDLE_HIT_RADIUS = 9; // screen pixels for grabbing an existing corner handle
@@ -413,11 +585,13 @@ function onBboxMouseDown(e) {
       item.boxes.push({ corners: st.drawingCorners });
       item.history.push("box");
       st.drawingCorners = [];
+      markSessionChanged();
     }
     redrawBbox();
   } else {
     item.points.push(imgPt);
     item.history.push("point");
+    markSessionChanged();
     redrawBbox();
   }
 }
@@ -439,6 +613,7 @@ function onBboxMouseMove(e) {
 
 window.addEventListener("mouseup", () => {
   if (mode !== "bbox") return;
+  if (state.bbox.draggingHandle) markSessionChanged();
   state.bbox.draggingHandle = null;
 });
 
@@ -537,16 +712,18 @@ function renderBboxList() {
     if (type === "box") item.boxes.splice(idx, 1); else item.points.splice(idx, 1);
     const hIdx = item.history.lastIndexOf(type);
     if (hIdx !== -1) item.history.splice(hIdx, 1);
+    markSessionChanged();
     redrawBbox();
   }));
 }
 document.getElementById("undoBboxBtn").addEventListener("click", () => {
   const st = state.bbox;
   const item = st.items[st.current];
-  if (st.drawingCorners.length > 0) { st.drawingCorners.pop(); redrawBbox(); return; }
+  if (st.drawingCorners.length > 0) { st.drawingCorners.pop(); markSessionChanged(); redrawBbox(); return; }
   const last = item.history.pop();
   if (last === "box") item.boxes.pop();
   else if (last === "point") item.points.pop();
+  markSessionChanged();
   redrawBbox();
 });
 document.getElementById("clearBboxBtn").addEventListener("click", () => {
@@ -555,6 +732,7 @@ document.getElementById("clearBboxBtn").addEventListener("click", () => {
   item.points = [];
   item.history = [];
   state.bbox.drawingCorners = [];
+  markSessionChanged();
   redrawBbox();
 });
 
@@ -567,19 +745,26 @@ document.getElementById("loadPairBtn").addEventListener("click", async () => {
   if (ceFiles.length !== newFiles.length) {
     if (!confirm(`CE 照片有 ${ceFiles.length} 張，新照片有 ${newFiles.length} 張，數量不一致。將依檔名排序後配對前 ${Math.min(ceFiles.length, newFiles.length)} 組，確定要繼續嗎？`)) return;
   }
-  const n = Math.min(ceFiles.length, newFiles.length);
-  const items = [];
-  for (let i = 0; i < n; i++) {
-    const ceImg = await loadImage(ceFiles[i]);
-    const newImg = await loadImage(newFiles[i]);
-    items.push({ ceFile: ceFiles[i].name, newFile: newFiles[i].name, ceImg, newImg, points: [] });
+  try {
+    const n = Math.min(ceFiles.length, newFiles.length);
+    const items = [];
+    for (let i = 0; i < n; i++) {
+      const ceImg = await loadImage(ceFiles[i]);
+      const newImg = await loadImage(newFiles[i]);
+      items.push({ ceFile: ceFiles[i].name, newFile: newFiles[i].name, ceFileObj: ceFiles[i], newFileObj: newFiles[i], ceImg, newImg, points: [] });
+    }
+    state.pair.items = items;
+    state.pair.current = 0;
+    state.pair.pendingCe = null;
+    document.getElementById("savePairBtn").disabled = false;
+    document.getElementById("exportPairBtn").disabled = false;
+    renderCurrent();
+    refreshNavBar();
+    markSessionChanged();
+  } catch (error) {
+    console.error(error);
+    alert(`載入照片失敗：${error.message}`);
   }
-  state.pair.items = items;
-  state.pair.current = 0;
-  state.pair.pendingCe = null;
-  document.getElementById("exportPairBtn").disabled = false;
-  renderCurrent();
-  refreshNavBar();
 });
 
 function renderPair() {
@@ -599,6 +784,7 @@ function renderPair() {
     const pt = toImgCoords(st.newInfo.canvas, st.newInfo.scale, e);
     pair.points.push({ ce: st.pendingCe, new: pt });
     st.pendingCe = null;
+    markSessionChanged();
     redrawPair();
 
     const autoAdvance = document.getElementById("autoAdvance").checked;
@@ -656,6 +842,7 @@ function renderPairList() {
   });
   el.querySelectorAll(".rm").forEach((r) => r.addEventListener("click", (e) => {
     pair.points.splice(Number(e.target.dataset.idx), 1);
+    markSessionChanged();
     redrawPair();
   }));
 }
@@ -663,11 +850,13 @@ document.getElementById("undoPairBtn").addEventListener("click", () => {
   const st = state.pair;
   if (st.pendingCe) st.pendingCe = null;
   else st.items[st.current].points.pop();
+  markSessionChanged();
   redrawPair();
 });
 document.getElementById("clearPairBtn").addEventListener("click", () => {
   state.pair.items[state.pair.current].points = [];
   state.pair.pendingCe = null;
+  markSessionChanged();
   redrawPair();
 });
 
@@ -677,6 +866,198 @@ function renderCurrent() {
   else { if (state.pair.items.length) renderPair(); }
   refreshNavBar();
 }
+
+async function buildBboxSessionPayload() {
+  return {
+    version: 1,
+    mode: "bbox",
+    savedAt: new Date().toISOString(),
+    className: document.getElementById("className").value.trim() || "c_cover",
+    current: state.bbox.current,
+    activeTool,
+    items: await Promise.all(state.bbox.items.map(async (item) => ({
+      file: item.file,
+      imageDataUrl: await fileToDataUrl(item.fileObj),
+      boxes: item.boxes,
+      points: item.points,
+      history: item.history,
+    }))),
+  };
+}
+
+async function buildPairSessionPayload() {
+  return {
+    version: 1,
+    mode: "pair",
+    savedAt: new Date().toISOString(),
+    autoAdvance: document.getElementById("autoAdvance").checked,
+    current: state.pair.current,
+    items: await Promise.all(state.pair.items.map(async (item) => ({
+      ceFile: item.ceFile,
+      newFile: item.newFile,
+      ceImageDataUrl: await fileToDataUrl(item.ceFileObj),
+      newImageDataUrl: await fileToDataUrl(item.newFileObj),
+      points: item.points,
+    }))),
+  };
+}
+
+async function saveCurrentSession(sessionMode) {
+  try {
+    const payload = sessionMode === "bbox"
+      ? await buildBboxSessionPayload()
+      : await buildPairSessionPayload();
+    const filename = createSessionFilename(sessionMode);
+    downloadJson(payload, filename);
+    try {
+      window.localStorage.setItem(STORAGE_KEYS[sessionMode], JSON.stringify(payload));
+    } catch (storageError) {
+      console.error(storageError);
+    }
+    updateDirtyState(false);
+    showToast(`✓ 已儲存 ${sessionMode === "bbox" ? "框選／熱點" : "對應點"} 暫存檔`);
+  } catch (error) {
+    console.error(error);
+    alert(`儲存進度失敗：${error.message}`);
+  }
+}
+
+async function restoreBboxSession(payload) {
+  if (!Array.isArray(payload.items) || payload.items.length === 0) {
+    throw new Error("暫存檔沒有可還原的照片資料");
+  }
+
+  const items = [];
+  for (const savedItem of payload.items) {
+    if (!savedItem.file || !savedItem.imageDataUrl) {
+      throw new Error("暫存檔格式不完整，缺少圖片資料");
+    }
+    const fileObj = dataUrlToFile(savedItem.imageDataUrl, savedItem.file);
+    const img = await loadImage(fileObj);
+    const boxes = Array.isArray(savedItem.boxes) ? savedItem.boxes.map(normalizeBox).filter(Boolean) : [];
+    const points = Array.isArray(savedItem.points) ? savedItem.points.map(normalizePoint).filter(Boolean) : [];
+    const history = Array.isArray(savedItem.history)
+      ? savedItem.history.filter((entry) => entry === "box" || entry === "point")
+      : [];
+    items.push({ file: savedItem.file, fileObj, img, boxes, points, history });
+  }
+
+  state.bbox.items = items;
+  state.bbox.current = Math.min(Math.max(Number(payload.current) || 0, 0), items.length - 1);
+  document.getElementById("className").value = payload.className || "c_cover";
+  document.getElementById("saveSingleBtn").disabled = false;
+  document.getElementById("exportSingleBtn").disabled = false;
+  setMode("bbox");
+  renderCurrent();
+  if (payload.activeTool === "point" || payload.activeTool === "quad") {
+    setTool(payload.activeTool);
+  }
+  updateDirtyState(false);
+}
+
+async function restorePairSession(payload) {
+  if (!Array.isArray(payload.items) || payload.items.length === 0) {
+    throw new Error("暫存檔沒有可還原的配對資料");
+  }
+
+  const items = [];
+  for (const savedItem of payload.items) {
+    if (!savedItem.ceFile || !savedItem.newFile || !savedItem.ceImageDataUrl || !savedItem.newImageDataUrl) {
+      throw new Error("暫存檔格式不完整，缺少配對圖片資料");
+    }
+    const ceFileObj = dataUrlToFile(savedItem.ceImageDataUrl, savedItem.ceFile);
+    const newFileObj = dataUrlToFile(savedItem.newImageDataUrl, savedItem.newFile);
+    const ceImg = await loadImage(ceFileObj);
+    const newImg = await loadImage(newFileObj);
+    const points = Array.isArray(savedItem.points)
+      ? savedItem.points.map((pointPair) => {
+          if (!pointPair) return null;
+          const cePoint = normalizePoint(pointPair.ce);
+          const newPoint = normalizePoint(pointPair.new);
+          if (!cePoint || !newPoint) return null;
+          return { ce: cePoint, new: newPoint };
+        }).filter(Boolean)
+      : [];
+    items.push({ ceFile: savedItem.ceFile, newFile: savedItem.newFile, ceFileObj, newFileObj, ceImg, newImg, points });
+  }
+
+  state.pair.items = items;
+  state.pair.current = Math.min(Math.max(Number(payload.current) || 0, 0), items.length - 1);
+  state.pair.pendingCe = null;
+  document.getElementById("autoAdvance").checked = payload.autoAdvance !== false;
+  document.getElementById("savePairBtn").disabled = false;
+  document.getElementById("exportPairBtn").disabled = false;
+  setMode("pair");
+  renderCurrent();
+  updateDirtyState(false);
+}
+
+async function restoreSessionPayload(payload, options = {}) {
+  if (!payload || (payload.mode !== "bbox" && payload.mode !== "pair")) {
+    throw new Error("這不是可辨識的標註暫存檔");
+  }
+  const hasExistingSession = state.bbox.items.length > 0 || state.pair.items.length > 0;
+  if (!options.skipOverwriteConfirm && hasExistingSession && !confirm("載入暫存檔會覆蓋目前頁面中的標註進度，確定要繼續嗎？")) {
+    return;
+  }
+  if (payload.mode === "bbox") {
+    await restoreBboxSession(payload);
+  } else {
+    await restorePairSession(payload);
+  }
+  showToast(options.source === "browser" ? "✓ 已還原瀏覽器自動暫存" : "✓ 已載入暫存進度");
+}
+
+async function restoreSessionFromFile(file) {
+  const text = await file.text();
+  const payload = JSON.parse(text);
+  await restoreSessionPayload(payload, { source: "file" });
+}
+
+document.getElementById("saveSingleBtn").addEventListener("click", () => saveCurrentSession("bbox"));
+document.getElementById("savePairBtn").addEventListener("click", () => saveCurrentSession("pair"));
+
+document.getElementById("loadSingleSessionBtn").addEventListener("click", () => {
+  activeSessionLoadMode = "bbox";
+  document.getElementById("sessionFileInput").click();
+});
+document.getElementById("loadPairSessionBtn").addEventListener("click", () => {
+  activeSessionLoadMode = "pair";
+  document.getElementById("sessionFileInput").click();
+});
+
+document.getElementById("sessionFileInput").addEventListener("change", async (event) => {
+  const [file] = event.target.files || [];
+  event.target.value = "";
+  if (!file) return;
+  try {
+    if (activeSessionLoadMode) setMode(activeSessionLoadMode);
+    await restoreSessionFromFile(file);
+  } catch (error) {
+    console.error(error);
+    alert(`載入暫存檔失敗：${error.message}`);
+  } finally {
+    activeSessionLoadMode = null;
+  }
+});
+
+document.getElementById("className").addEventListener("input", () => {
+  if (state.bbox.items.length === 0) return;
+  markSessionChanged();
+});
+
+document.getElementById("autoAdvance").addEventListener("change", () => {
+  if (state.pair.items.length === 0) return;
+  markSessionChanged();
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (!hasUnsavedChanges) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+maybeOfferAutoRestore();
 
 // ================= EXPORTS =================
 document.getElementById("exportSingleBtn").addEventListener("click", async () => {
