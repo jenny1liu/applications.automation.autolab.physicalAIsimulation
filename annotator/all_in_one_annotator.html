@@ -180,18 +180,25 @@
 <!-- ===== PAIR load bar ===== -->
 <div class="setup mode-panel" id="setup-pair">
   <div class="field">
-    <label>CE 標註照片（可多選，依檔名排序配對）</label>
+    <label>CE 標註照片（可多選，依檔名排序）</label>
     <input type="file" id="ceFiles" accept="image/*" multiple>
   </div>
   <div class="field">
-    <label>新照片（可多選，依檔名排序配對）</label>
+    <label>新照片（可多選，依檔名排序）</label>
     <input type="file" id="newFiles" accept="image/*" multiple>
   </div>
-  <button class="primary" id="loadPairBtn">批次載入</button>
-  <div class="field" style="flex-direction:row; align-items:center; gap:8px;">
-    <input type="checkbox" id="autoAdvance" checked style="width:16px;height:16px;">
-    <label style="text-transform:none; font-size:13px; color:var(--text);">每組標 1 個點，完成後自動跳下一組</label>
+  <div class="field">
+    <label>配對來源切換</label>
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <button id="cePrevBtn" disabled>CE ←</button>
+      <span id="ceSelectText" style="font-family:var(--mono); font-size:12px; color:var(--muted); min-width:120px;">CE: 未載入</span>
+      <button id="ceNextBtn" disabled>→ CE</button>
+      <button id="newPrevBtn" disabled>新 ←</button>
+      <span id="newSelectText" style="font-family:var(--mono); font-size:12px; color:var(--muted); min-width:120px;">新: 未載入</span>
+      <button id="newNextBtn" disabled>→ 新</button>
+    </div>
   </div>
+  <button class="primary" id="loadPairBtn">批次載入</button>
   <div class="spacer" style="flex:1"></div>
   <button id="savePairBtn" disabled>儲存進度</button>
   <button id="loadPairSessionBtn">載入暫存檔</button>
@@ -240,8 +247,9 @@
         <div class="canvas-wrap" id="newWrap"><div class="empty-hint">載入照片後顯示於此</div></div>
       </div>
     </div>
-    <div class="hint-bar">標註方式：先點左邊 CE 照片上的量測點，再點右邊新照片上對應的同一個位置，即完成一組配對（自動編號、配色一致）。</div>
+    <div class="hint-bar">標註方式：先點左邊 CE 照片上的量測點，再點右邊新照片上對應的同一個位置，最後按「確定這組配對點」才會加入清單。</div>
     <div class="toolbar">
+      <button class="primary" id="confirmPairBtn" disabled>確定這組配對點</button>
       <button class="ghost" id="undoPairBtn" disabled>復原上一步</button>
       <button class="danger-ghost ghost" id="clearPairBtn" disabled>清空這組的點</button>
     </div>
@@ -262,10 +270,46 @@ let hasUnsavedChanges = false;
 let autoSaveTimer = null;
 let autoRestorePromptShown = false;
 
+// ---- IndexedDB-backed auto-save store (localStorage is too small for embedded images) ----
+const IDB_NAME = "annotatorAutosave";
+const IDB_STORE = "sessions";
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(IDB_NAME, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(IDB_STORE);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+function idbSet(key, value) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  }));
+}
+function idbGet(key) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const request = tx.objectStore(IDB_STORE).get(key);
+    request.onsuccess = () => { db.close(); resolve(request.result ?? null); };
+    request.onerror = () => { db.close(); reject(request.error); };
+  }));
+}
+function idbDelete(key) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  }));
+}
+
 // ---- shared state per mode ----
 const state = {
   bbox: { items: [], current: 0, canvasInfo: null, drawingCorners: [], draggingHandle: null, mousePos: null },
-  pair: { items: [], current: 0, pendingCe: null, ceInfo: null, newInfo: null },
+  pair: { ceItems: [], newItems: [], ceCurrent: 0, newCurrent: 0, pendingCe: null, pendingNew: null, ceInfo: null, newInfo: null, points: [], loaded: false },
 };
 
 function showToast(msg) {
@@ -357,8 +401,9 @@ function createSessionFilename(sessionMode) {
     const prefix = firstFile ? sanitizeFilePart(firstFile) : "bbox_annotations";
     return `${prefix}_bbox_session_${stamp}.json`;
   }
-  const firstPair = state.pair.items[0];
-  const prefix = firstPair ? `${sanitizeFilePart(firstPair.ceFile)}_to_${sanitizeFilePart(firstPair.newFile)}` : "point_pairs";
+  const firstCe = state.pair.ceItems[0];
+  const firstNew = state.pair.newItems[0];
+  const prefix = firstCe && firstNew ? `${sanitizeFilePart(firstCe.file)}_to_${sanitizeFilePart(firstNew.file)}` : "point_pairs";
   return `${prefix}_pair_session_${stamp}.json`;
 }
 
@@ -366,8 +411,11 @@ function updateDirtyState(isDirty) {
   hasUnsavedChanges = isDirty;
 }
 
-function readAutoSavedPayload(sessionMode) {
+async function readAutoSavedPayload(sessionMode) {
   try {
+    const stored = await idbGet(STORAGE_KEYS[sessionMode]);
+    if (stored) return stored;
+    // migrate legacy localStorage autosave if present
     const raw = window.localStorage.getItem(STORAGE_KEYS[sessionMode]);
     return raw ? JSON.parse(raw) : null;
   } catch (error) {
@@ -376,19 +424,22 @@ function readAutoSavedPayload(sessionMode) {
   }
 }
 
-function clearAutoSavedPayload(sessionMode) {
+async function clearAutoSavedPayload(sessionMode) {
   try {
+    await idbDelete(STORAGE_KEYS[sessionMode]);
     window.localStorage.removeItem(STORAGE_KEYS[sessionMode]);
   } catch (error) {
     console.error(error);
   }
 }
 
-function maybeOfferAutoRestore() {
+async function maybeOfferAutoRestore() {
   if (autoRestorePromptShown) return;
   autoRestorePromptShown = true;
-  const bboxPayload = readAutoSavedPayload("bbox");
-  const pairPayload = readAutoSavedPayload("pair");
+  const [bboxPayload, pairPayload] = await Promise.all([
+    readAutoSavedPayload("bbox"),
+    readAutoSavedPayload("pair"),
+  ]);
   const candidate = [bboxPayload, pairPayload]
     .filter((payload) => payload && payload.savedAt)
     .sort((left, right) => new Date(right.savedAt).getTime() - new Date(left.savedAt).getTime())[0];
@@ -411,13 +462,14 @@ function maybeOfferAutoRestore() {
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimer);
   autoSaveTimer = setTimeout(async () => {
-    const sessionMode = state.pair.items.length > 0 && mode === "pair" ? "pair" : (state.bbox.items.length > 0 ? "bbox" : null);
+    const pairLoaded = state.pair.ceItems.length > 0 && state.pair.newItems.length > 0;
+    const sessionMode = pairLoaded && mode === "pair" ? "pair" : (state.bbox.items.length > 0 ? "bbox" : null);
     if (!sessionMode) return;
     try {
       const payload = sessionMode === "bbox"
         ? await buildBboxSessionPayload()
         : await buildPairSessionPayload();
-      window.localStorage.setItem(STORAGE_KEYS[sessionMode], JSON.stringify(payload));
+      await idbSet(STORAGE_KEYS[sessionMode], payload);
       updateDirtyState(false);
       showToast(`✓ 已自動暫存到瀏覽器${sessionMode === "bbox" ? "（框選／熱點）" : "（對應點）"}`);
     } catch (error) {
@@ -449,7 +501,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
 });
 
 function currentModeState() { return state[mode]; }
-function currentItems() { return mode === "pair" ? state.pair.items : currentModeState().items; }
+function currentItems() { return mode === "pair" ? [] : currentModeState().items; }
 
 function refreshNavBar() {
   const items = currentItems();
@@ -742,20 +794,19 @@ document.getElementById("loadPairBtn").addEventListener("click", async () => {
   const ceFiles = Array.from(document.getElementById("ceFiles").files).sort((a, b) => a.name.localeCompare(b.name));
   const newFiles = Array.from(document.getElementById("newFiles").files).sort((a, b) => a.name.localeCompare(b.name));
   if (ceFiles.length === 0 || newFiles.length === 0) { alert("請至少各選一張 CE 照片與新照片"); return; }
-  if (ceFiles.length !== newFiles.length) {
-    if (!confirm(`CE 照片有 ${ceFiles.length} 張，新照片有 ${newFiles.length} 張，數量不一致。將依檔名排序後配對前 ${Math.min(ceFiles.length, newFiles.length)} 組，確定要繼續嗎？`)) return;
-  }
   try {
-    const n = Math.min(ceFiles.length, newFiles.length);
-    const items = [];
-    for (let i = 0; i < n; i++) {
-      const ceImg = await loadImage(ceFiles[i]);
-      const newImg = await loadImage(newFiles[i]);
-      items.push({ ceFile: ceFiles[i].name, newFile: newFiles[i].name, ceFileObj: ceFiles[i], newFileObj: newFiles[i], ceImg, newImg, points: [] });
-    }
-    state.pair.items = items;
-    state.pair.current = 0;
+    const ceItems = [];
+    const newItems = [];
+    for (const f of ceFiles) ceItems.push({ file: f.name, fileObj: f, img: await loadImage(f) });
+    for (const f of newFiles) newItems.push({ file: f.name, fileObj: f, img: await loadImage(f) });
+    state.pair.ceItems = ceItems;
+    state.pair.newItems = newItems;
+    state.pair.ceCurrent = 0;
+    state.pair.newCurrent = 0;
     state.pair.pendingCe = null;
+    state.pair.pendingNew = null;
+    state.pair.points = [];
+    state.pair.loaded = true;
     document.getElementById("savePairBtn").disabled = false;
     document.getElementById("exportPairBtn").disabled = false;
     renderCurrent();
@@ -769,49 +820,53 @@ document.getElementById("loadPairBtn").addEventListener("click", async () => {
 
 function renderPair() {
   const st = state.pair;
-  const pair = st.items[st.current];
-  document.getElementById("ceName").textContent = pair.ceFile;
-  document.getElementById("newName").textContent = pair.newFile;
+  const ceItem = st.ceItems[st.ceCurrent];
+  const newItem = st.newItems[st.newCurrent];
+  document.getElementById("ceName").textContent = ceItem.file;
+  document.getElementById("newName").textContent = newItem.file;
+  document.getElementById("ceSelectText").textContent = `CE: ${st.ceCurrent + 1}/${st.ceItems.length}`;
+  document.getElementById("newSelectText").textContent = `新: ${st.newCurrent + 1}/${st.newItems.length}`;
+  document.getElementById("cePrevBtn").disabled = st.ceCurrent === 0;
+  document.getElementById("ceNextBtn").disabled = st.ceCurrent === st.ceItems.length - 1;
+  document.getElementById("newPrevBtn").disabled = st.newCurrent === 0;
+  document.getElementById("newNextBtn").disabled = st.newCurrent === st.newItems.length - 1;
+
   st.pendingCe = null;
-  st.ceInfo = makeBaseCanvas(document.getElementById("ceWrap"), pair.ceImg);
-  st.newInfo = makeBaseCanvas(document.getElementById("newWrap"), pair.newImg);
+  st.pendingNew = null;
+  st.ceInfo = makeBaseCanvas(document.getElementById("ceWrap"), ceItem.img);
+  st.newInfo = makeBaseCanvas(document.getElementById("newWrap"), newItem.img);
   st.ceInfo.canvas.addEventListener("click", (e) => {
     st.pendingCe = toImgCoords(st.ceInfo.canvas, st.ceInfo.scale, e);
     redrawPair();
   });
   st.newInfo.canvas.addEventListener("click", (e) => {
-    if (!st.pendingCe) return;
-    const pt = toImgCoords(st.newInfo.canvas, st.newInfo.scale, e);
-    pair.points.push({ ce: st.pendingCe, new: pt });
-    st.pendingCe = null;
-    markSessionChanged();
+    st.pendingNew = toImgCoords(st.newInfo.canvas, st.newInfo.scale, e);
     redrawPair();
-
-    const autoAdvance = document.getElementById("autoAdvance").checked;
-    if (autoAdvance) {
-      if (st.current < st.items.length - 1) {
-        showToast("✓ 這組完成，已自動跳到下一組");
-        setTimeout(() => { st.current++; renderCurrent(); refreshNavBar(); }, 350);
-      } else {
-        showToast("✓ 這組完成！這是最後一組了，可以匯出 JSON 了");
-      }
-    }
   });
   redrawPair();
-  document.getElementById("undoPairBtn").disabled = false;
-  document.getElementById("clearPairBtn").disabled = false;
 }
 function redrawPair() {
   const st = state.pair;
-  const pair = st.items[st.current];
-  st.ceInfo.ctx.drawImage(pair.ceImg, 0, 0, st.ceInfo.canvas.width, st.ceInfo.canvas.height);
-  st.newInfo.ctx.drawImage(pair.newImg, 0, 0, st.newInfo.canvas.width, st.newInfo.canvas.height);
-  pair.points.forEach((p, idx) => {
+  const ceItem = st.ceItems[st.ceCurrent];
+  const newItem = st.newItems[st.newCurrent];
+  st.ceInfo.ctx.drawImage(ceItem.img, 0, 0, st.ceInfo.canvas.width, st.ceInfo.canvas.height);
+  st.newInfo.ctx.drawImage(newItem.img, 0, 0, st.newInfo.canvas.width, st.newInfo.canvas.height);
+
+  const samePairPoints = st.points.filter((p) => p.ceFile === ceItem.file && p.newFile === newItem.file);
+  samePairPoints.forEach((p, idx) => {
     const color = PALETTE[idx % PALETTE.length];
     drawMarker(st.ceInfo, p.ce, color, idx + 1);
     drawMarker(st.newInfo, p.new, color, idx + 1);
   });
-  if (st.pendingCe) drawMarker(st.ceInfo, st.pendingCe, "#FFFFFF", pair.points.length + 1, true);
+
+  const nextLabel = samePairPoints.length + 1;
+  if (st.pendingCe) drawMarker(st.ceInfo, st.pendingCe, "#FFFFFF", nextLabel, true);
+  if (st.pendingNew) drawMarker(st.newInfo, st.pendingNew, "#FFFFFF", nextLabel, true);
+
+  document.getElementById("confirmPairBtn").disabled = !(st.pendingCe && st.pendingNew);
+  document.getElementById("undoPairBtn").disabled = !(st.pendingCe || st.pendingNew || st.points.length > 0);
+  document.getElementById("clearPairBtn").disabled = !(st.pendingCe || st.pendingNew || samePairPoints.length > 0);
+
   renderPairList();
 }
 function drawMarker(info, pt, color, label, pending = false) {
@@ -830,32 +885,64 @@ function drawMarker(info, pt, color, label, pending = false) {
   info.ctx.fillText(label, x, y - 12);
 }
 function renderPairList() {
-  const pair = state.pair.items[state.pair.current];
+  const st = state.pair;
   const el = document.getElementById("pairList");
   el.innerHTML = "";
-  pair.points.forEach((p, idx) => {
+  st.points.forEach((p, idx) => {
     const chip = document.createElement("div");
     chip.className = "anno-chip";
     chip.style.borderColor = PALETTE[idx % PALETTE.length];
-    chip.innerHTML = `<span class="n" style="color:${PALETTE[idx % PALETTE.length]}">#${idx + 1}</span> CE(${p.ce[0].toFixed(0)},${p.ce[1].toFixed(0)}) → 新(${p.new[0].toFixed(0)},${p.new[1].toFixed(0)}) <span class="rm" data-idx="${idx}">✕</span>`;
+    chip.innerHTML = `<span class="n" style="color:${PALETTE[idx % PALETTE.length]}">#${idx + 1}</span> [${p.ceFile} → ${p.newFile}] CE(${p.ce[0].toFixed(0)},${p.ce[1].toFixed(0)}) → 新(${p.new[0].toFixed(0)},${p.new[1].toFixed(0)}) <span class="rm" data-idx="${idx}">✕</span>`;
     el.appendChild(chip);
   });
   el.querySelectorAll(".rm").forEach((r) => r.addEventListener("click", (e) => {
-    pair.points.splice(Number(e.target.dataset.idx), 1);
+    st.points.splice(Number(e.target.dataset.idx), 1);
     markSessionChanged();
     redrawPair();
   }));
 }
+
+function movePairSelection(target, delta) {
+  const st = state.pair;
+  const key = target === "ce" ? "ceCurrent" : "newCurrent";
+  const items = target === "ce" ? st.ceItems : st.newItems;
+  const next = st[key] + delta;
+  if (next < 0 || next > items.length - 1) return;
+  st[key] = next;
+  renderPair();
+}
+document.getElementById("cePrevBtn").addEventListener("click", () => movePairSelection("ce", -1));
+document.getElementById("ceNextBtn").addEventListener("click", () => movePairSelection("ce", 1));
+document.getElementById("newPrevBtn").addEventListener("click", () => movePairSelection("new", -1));
+document.getElementById("newNextBtn").addEventListener("click", () => movePairSelection("new", 1));
+
+document.getElementById("confirmPairBtn").addEventListener("click", () => {
+  const st = state.pair;
+  if (!st.pendingCe || !st.pendingNew) return;
+  const ceItem = st.ceItems[st.ceCurrent];
+  const newItem = st.newItems[st.newCurrent];
+  st.points.push({ ceFile: ceItem.file, newFile: newItem.file, ce: st.pendingCe, new: st.pendingNew });
+  st.pendingCe = null;
+  st.pendingNew = null;
+  showToast("✓ 已加入配對清單");
+  markSessionChanged();
+  redrawPair();
+});
 document.getElementById("undoPairBtn").addEventListener("click", () => {
   const st = state.pair;
-  if (st.pendingCe) st.pendingCe = null;
-  else st.items[st.current].points.pop();
+  if (st.pendingNew) st.pendingNew = null;
+  else if (st.pendingCe) st.pendingCe = null;
+  else st.points.pop();
   markSessionChanged();
   redrawPair();
 });
 document.getElementById("clearPairBtn").addEventListener("click", () => {
-  state.pair.items[state.pair.current].points = [];
-  state.pair.pendingCe = null;
+  const st = state.pair;
+  const ceItem = st.ceItems[st.ceCurrent];
+  const newItem = st.newItems[st.newCurrent];
+  st.points = st.points.filter((p) => !(p.ceFile === ceItem.file && p.newFile === newItem.file));
+  st.pendingCe = null;
+  st.pendingNew = null;
   markSessionChanged();
   redrawPair();
 });
@@ -863,7 +950,7 @@ document.getElementById("clearPairBtn").addEventListener("click", () => {
 // ================= RENDER DISPATCH =================
 function renderCurrent() {
   if (mode === "bbox") { if (state.bbox.items.length) renderBbox(); }
-  else { if (state.pair.items.length) renderPair(); }
+  else { if (state.pair.loaded && state.pair.ceItems.length && state.pair.newItems.length) renderPair(); }
   refreshNavBar();
 }
 
@@ -887,18 +974,20 @@ async function buildBboxSessionPayload() {
 
 async function buildPairSessionPayload() {
   return {
-    version: 1,
+    version: 2,
     mode: "pair",
     savedAt: new Date().toISOString(),
-    autoAdvance: document.getElementById("autoAdvance").checked,
-    current: state.pair.current,
-    items: await Promise.all(state.pair.items.map(async (item) => ({
-      ceFile: item.ceFile,
-      newFile: item.newFile,
-      ceImageDataUrl: await fileToDataUrl(item.ceFileObj),
-      newImageDataUrl: await fileToDataUrl(item.newFileObj),
-      points: item.points,
+    ceCurrent: state.pair.ceCurrent,
+    newCurrent: state.pair.newCurrent,
+    ceItems: await Promise.all(state.pair.ceItems.map(async (item) => ({
+      file: item.file,
+      imageDataUrl: await fileToDataUrl(item.fileObj),
     }))),
+    newItems: await Promise.all(state.pair.newItems.map(async (item) => ({
+      file: item.file,
+      imageDataUrl: await fileToDataUrl(item.fileObj),
+    }))),
+    points: state.pair.points,
   };
 }
 
@@ -910,7 +999,7 @@ async function saveCurrentSession(sessionMode) {
     const filename = createSessionFilename(sessionMode);
     downloadJson(payload, filename);
     try {
-      window.localStorage.setItem(STORAGE_KEYS[sessionMode], JSON.stringify(payload));
+      await idbSet(STORAGE_KEYS[sessionMode], payload);
     } catch (storageError) {
       console.error(storageError);
     }
@@ -956,35 +1045,58 @@ async function restoreBboxSession(payload) {
 }
 
 async function restorePairSession(payload) {
-  if (!Array.isArray(payload.items) || payload.items.length === 0) {
+  let ceSaved = Array.isArray(payload.ceItems) ? payload.ceItems : null;
+  let newSaved = Array.isArray(payload.newItems) ? payload.newItems : null;
+  let savedPoints = Array.isArray(payload.points) ? payload.points : [];
+
+  // backward compatibility: old index-paired session format
+  if (!ceSaved && Array.isArray(payload.items)) {
+    const ceMap = new Map();
+    const newMap = new Map();
+    savedPoints = [];
+    for (const item of payload.items) {
+      if (item.ceFile && item.ceImageDataUrl && !ceMap.has(item.ceFile)) ceMap.set(item.ceFile, { file: item.ceFile, imageDataUrl: item.ceImageDataUrl });
+      if (item.newFile && item.newImageDataUrl && !newMap.has(item.newFile)) newMap.set(item.newFile, { file: item.newFile, imageDataUrl: item.newImageDataUrl });
+      (Array.isArray(item.points) ? item.points : []).forEach((pt) => {
+        if (pt && pt.ce && pt.new) savedPoints.push({ ceFile: item.ceFile, newFile: item.newFile, ce: pt.ce, new: pt.new });
+      });
+    }
+    ceSaved = Array.from(ceMap.values());
+    newSaved = Array.from(newMap.values());
+  }
+
+  if (!ceSaved || !newSaved || ceSaved.length === 0 || newSaved.length === 0) {
     throw new Error("暫存檔沒有可還原的配對資料");
   }
 
-  const items = [];
-  for (const savedItem of payload.items) {
-    if (!savedItem.ceFile || !savedItem.newFile || !savedItem.ceImageDataUrl || !savedItem.newImageDataUrl) {
-      throw new Error("暫存檔格式不完整，缺少配對圖片資料");
-    }
-    const ceFileObj = dataUrlToFile(savedItem.ceImageDataUrl, savedItem.ceFile);
-    const newFileObj = dataUrlToFile(savedItem.newImageDataUrl, savedItem.newFile);
-    const ceImg = await loadImage(ceFileObj);
-    const newImg = await loadImage(newFileObj);
-    const points = Array.isArray(savedItem.points)
-      ? savedItem.points.map((pointPair) => {
-          if (!pointPair) return null;
-          const cePoint = normalizePoint(pointPair.ce);
-          const newPoint = normalizePoint(pointPair.new);
-          if (!cePoint || !newPoint) return null;
-          return { ce: cePoint, new: newPoint };
-        }).filter(Boolean)
-      : [];
-    items.push({ ceFile: savedItem.ceFile, newFile: savedItem.newFile, ceFileObj, newFileObj, ceImg, newImg, points });
+  const ceItems = [];
+  for (const saved of ceSaved) {
+    if (!saved.file || !saved.imageDataUrl) throw new Error("暫存檔格式不完整，缺少 CE 圖片資料");
+    const fileObj = dataUrlToFile(saved.imageDataUrl, saved.file);
+    ceItems.push({ file: saved.file, fileObj, img: await loadImage(fileObj) });
   }
+  const newItems = [];
+  for (const saved of newSaved) {
+    if (!saved.file || !saved.imageDataUrl) throw new Error("暫存檔格式不完整，缺少新圖片資料");
+    const fileObj = dataUrlToFile(saved.imageDataUrl, saved.file);
+    newItems.push({ file: saved.file, fileObj, img: await loadImage(fileObj) });
+  }
+  const points = savedPoints.map((p) => {
+    if (!p || !p.ceFile || !p.newFile) return null;
+    const ce = normalizePoint(p.ce);
+    const nw = normalizePoint(p.new);
+    if (!ce || !nw) return null;
+    return { ceFile: p.ceFile, newFile: p.newFile, ce, new: nw };
+  }).filter(Boolean);
 
-  state.pair.items = items;
-  state.pair.current = Math.min(Math.max(Number(payload.current) || 0, 0), items.length - 1);
+  state.pair.ceItems = ceItems;
+  state.pair.newItems = newItems;
+  state.pair.ceCurrent = Math.min(Math.max(Number(payload.ceCurrent) || 0, 0), ceItems.length - 1);
+  state.pair.newCurrent = Math.min(Math.max(Number(payload.newCurrent) || 0, 0), newItems.length - 1);
   state.pair.pendingCe = null;
-  document.getElementById("autoAdvance").checked = payload.autoAdvance !== false;
+  state.pair.pendingNew = null;
+  state.pair.points = points;
+  state.pair.loaded = true;
   document.getElementById("savePairBtn").disabled = false;
   document.getElementById("exportPairBtn").disabled = false;
   setMode("pair");
@@ -996,7 +1108,7 @@ async function restoreSessionPayload(payload, options = {}) {
   if (!payload || (payload.mode !== "bbox" && payload.mode !== "pair")) {
     throw new Error("這不是可辨識的標註暫存檔");
   }
-  const hasExistingSession = state.bbox.items.length > 0 || state.pair.items.length > 0;
+  const hasExistingSession = state.bbox.items.length > 0 || state.pair.ceItems.length > 0 || state.pair.newItems.length > 0;
   if (!options.skipOverwriteConfirm && hasExistingSession && !confirm("載入暫存檔會覆蓋目前頁面中的標註進度，確定要繼續嗎？")) {
     return;
   }
@@ -1043,11 +1155,6 @@ document.getElementById("sessionFileInput").addEventListener("change", async (ev
 
 document.getElementById("className").addEventListener("input", () => {
   if (state.bbox.items.length === 0) return;
-  markSessionChanged();
-});
-
-document.getElementById("autoAdvance").addEventListener("change", () => {
-  if (state.pair.items.length === 0) return;
   markSessionChanged();
 });
 
@@ -1110,10 +1217,11 @@ document.getElementById("exportSingleBtn").addEventListener("click", async () =>
 });
 
 document.getElementById("exportPairBtn").addEventListener("click", () => {
-  const data = state.pair.items.map((p) => ({
+  const data = state.pair.points.map((p) => ({
     ce_file: p.ceFile,
     new_file: p.newFile,
-    points: p.points.map((pt) => ({ ce: [Math.round(pt.ce[0]), Math.round(pt.ce[1])], new: [Math.round(pt.new[0]), Math.round(pt.new[1])] })),
+    ce: [Math.round(p.ce[0]), Math.round(p.ce[1])],
+    new: [Math.round(p.new[0]), Math.round(p.new[1])],
   }));
   downloadJson(data, "point_correspondences.json");
 });
