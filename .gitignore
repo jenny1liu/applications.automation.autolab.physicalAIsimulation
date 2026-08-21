@@ -46,3 +46,14 @@ artifacts/*.png
 
 # Benchmark_app results
 thermal/benchmark_app/*.csv
+/annotator/benchmark_runs
+/annotator/extracted
+/annotator/extracted_dell
+/annotator/extracted_dell_lenovo
+/annotator/extracted_hp
+/annotator/extracted_lenovo
+/annotator/ov_models
+/build
+/dist/MarkerBenchmark
+/annotator/webapp/build
+/annotator/webapp/dist
