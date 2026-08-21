@@ -1,0 +1,8 @@
+# Web app extra dependencies (on top of the project's requirements.txt).
+# The heavy ML deps (numpy, opencv-python, torch, torchvision, kornia,
+# openvino, onnx, onnxscript, psutil) come from ../../requirements.txt.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+# Packaging (build-time only):
+# pyinstaller>=6.0

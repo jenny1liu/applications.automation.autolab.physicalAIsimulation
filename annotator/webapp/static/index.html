@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Marker Matching Benchmark</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182031; --edge: #2a3550;
+    --txt: #e7ecf5; --muted: #93a0bd; --accent: #4f8cff;
+    --green: #35c46a; --red: #ff5964; --yellow: #e7c84b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--edge);
+    display: flex; align-items: baseline; gap: 14px;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .wrap { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); margin: 0 0 10px; }
+  label.field { display: block; margin: 9px 0; }
+  label.field span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+  .help {
+    position: relative; display: inline-block; width: 14px; height: 14px; line-height: 14px;
+    text-align: center; border-radius: 50%; background: var(--edge); color: var(--txt);
+    font-size: 10px; font-style: normal; font-weight: 700; cursor: help; margin-left: 5px;
+  }
+  .help .tip {
+    display: none; position: absolute; z-index: 30; left: 50%; top: 150%; transform: translateX(-50%);
+    width: 220px; background: #0b1120; border: 1px solid var(--edge); color: var(--txt);
+    padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.5; font-weight: 400;
+    text-align: left; box-shadow: 0 6px 18px rgba(0,0,0,.55); white-space: normal;
+  }
+  .help:hover .tip { display: block; }
+  .namerow { display: flex; gap: 6px; }
+  .namerow input { flex: 1; }
+  .namerow .navbtn { flex: 0 0 auto; padding: 7px 11px; }
+  input[type=text] {
+    width: 100%; background: #0c111c; border: 1px solid var(--edge); color: var(--txt);
+    border-radius: 7px; padding: 7px 9px; font-size: 13px;
+  }
+  .namehint { display: block; font-size: 11px; margin-top: 4px; min-height: 14px; }
+  .namehint.ok { color: var(--green); }
+  .namehint.bad { color: var(--red); }
+  #panelLoad select {
+    flex: 1; background: #0c111c; color: var(--txt); border: 1px solid var(--edge);
+    border-radius: 7px; padding: 7px 9px; font-size: 13px;
+  }
+  input[type=number], input[type=file] {
+    width: 100%; background: #0c111c; border: 1px solid var(--edge); color: var(--txt);
+    border-radius: 7px; padding: 7px 9px; font-size: 13px;
+  }
+  .engines label { display: flex; align-items: center; gap: 8px; margin: 6px 0; cursor: pointer; }
+  .engines input { accent-color: var(--accent); }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 10px 14px; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .status { margin-top: 10px; font-size: 12px; color: var(--muted); min-height: 16px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border: 1px solid var(--edge); padding: 7px 9px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; color: var(--muted); }
+  thead th { background: #0c111c; }
+  thead th a { color: var(--accent); font-weight: 400; font-size: 11px; }
+  .best { color: var(--green); font-weight: 700; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab {
+    background: #0c111c; border: 1px solid var(--edge); color: var(--muted);
+    padding: 6px 12px; border-radius: 7px; cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .browser-top { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .browser-top select { background: #0c111c; color: var(--txt); border: 1px solid var(--edge);
+    border-radius: 7px; padding: 6px 8px; }
+  .navbtn { width: auto; padding: 6px 12px; }
+  .vis-img { width: 100%; border: 1px solid var(--edge); border-radius: 8px; background: #000; }
+  .pairinfo { margin: 8px 0; font-size: 13px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 12px; margin-right: 6px; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.7; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .muted { color: var(--muted); }
+  .err { color: var(--red); }
+  .hidden { display: none; }
+  code { background: #0c111c; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Marker Matching Benchmark</h1>
+  <span class="sub">上傳 annotator session JSON → 比較 SIFT / LightGlue / OpenVINO 的對位精度與效能</span>
+</header>
+
+<div class="wrap">
+  <!-- ------------------------------------------------ config -->
+  <div class="card" id="config">
+    <div class="tabs" id="modeTabs">
+      <div class="tab active" data-mode="new">新測試</div>
+      <div class="tab" data-mode="load">載入既有結果</div>
+    </div>
+
+    <div id="panelNew">
+    <h2>設定</h2>
+    <label class="field">
+      <span>Session JSON 檔</span>
+      <input type="file" id="jsonFile" accept=".json,application/json">
+    </label>
+
+    <label class="field">
+      <span>輸出資料夾名稱 (run_id) <i class="help">?<span class="tip">結果會存到 runs/&lt;此名稱&gt;/。留空則自動用「時間戳_亂碼」。只允許英數、`_`、`-`、`.`；不可與現有資料夾同名。</span></i></span>
+      <div class="namerow">
+        <input type="text" id="run_name" placeholder="留空＝自動產生" autocomplete="off">
+        <button type="button" class="navbtn" id="genName" title="產生新的預設名稱">↻</button>
+      </div>
+      <small class="namehint" id="nameHint"></small>
+    </label>
+
+    <div class="grid2">
+      <label class="field">
+        <span>lg-features (DISK) <i class="help">?<span class="tip">DISK 特徵點上限。越多越準但越慢、記憶體越高。只影響 LightGlue / OpenVINO。</span></i></span>
+        <input type="number" id="lg_features" value="1024">
+      </label>
+      <label class="field">
+        <span>max-features (SIFT) <i class="help">?<span class="tip">SIFT 特徵點上限。越多越準但越慢。只影響 OpenCV 引擎。</span></i></span>
+        <input type="number" id="max_features" value="4000">
+      </label>
+      <label class="field">
+        <span>min-matches <i class="help">?<span class="tip">配對數低於此值就視為「配對失敗」。調高＝更嚴格，寧缺勿濫。</span></i></span>
+        <input type="number" id="min_matches" value="8">
+      </label>
+      <label class="field">
+        <span>ratio <i class="help">?<span class="tip">Lowe 比值測試門檻，越低越嚴格（保留更可靠的配對）。只影響 SIFT。</span></i></span>
+        <input type="number" step="0.05" id="ratio" value="0.75">
+      </label>
+      <label class="field">
+        <span>ransac-thresh (px) <i class="help">?<span class="tip">RANSAC 容許的重投影誤差（px）。越小越嚴格、剔除越多 outlier；太小可能無解。</span></i></span>
+        <input type="number" step="0.5" id="ransac_thresh" value="5.0">
+      </label>
+      <label class="field">
+        <span>ov-size <i class="help">?<span class="tip">OpenVINO 模型的方形輸入邊長（16 的倍數）。越大越準但越慢、記憶體高。只影響 OpenVINO。</span></i></span>
+        <input type="number" step="16" id="ov_size" value="1024">
+      </label>
+      <label class="field">
+        <span>max-dim <i class="help">?<span class="tip">處理前把影像長邊縮到此上限（px）以加速偵測。影響 SIFT 與 LightGlue。</span></i></span>
+        <input type="number" id="max_dim" value="1280">
+      </label>
+    </div>
+
+    <h2 style="margin-top:14px">引擎 / 裝置</h2>
+    <div class="engines" id="engines"><span class="muted">載入中…</span></div>
+
+    <button id="runBtn" disabled>執行 Benchmark</button>
+    <div class="status" id="status"></div>
+    </div><!-- /panelNew -->
+
+    <div id="panelLoad" class="hidden">
+      <h2>載入既有結果</h2>
+      <label class="field">
+        <span>結果資料夾 (runs/) <i class="help">?<span class="tip">選擇先前跑過、存在 runs/ 底下的結果資料夾，直接重建指標表與疊圖，不需重新計算。</span></i></span>
+        <div class="namerow">
+          <select id="runSelect"></select>
+          <button type="button" class="navbtn" id="refreshRuns" title="重新整理清單">↻</button>
+        </div>
+      </label>
+      <button id="loadBtn" disabled>載入結果</button>
+      <div class="status" id="loadStatus"></div>
+    </div><!-- /panelLoad -->
+  </div>
+
+  <!-- ------------------------------------------------ results -->
+  <div>
+    <div class="card" id="metricsCard" style="margin-bottom:16px">
+      <h2>指標比較</h2>
+      <div id="metrics"><span class="muted">尚無結果。請上傳 JSON 並執行。</span></div>
+    </div>
+
+    <div class="card hidden" id="browserCard">
+      <h2>每組配對疊圖</h2>
+      <div class="tabs" id="engineTabs"></div>
+      <div class="browser-top">
+        <button class="navbtn" id="prevBtn">◀ 上一組</button>
+        <select id="pairSelect"></select>
+        <button class="navbtn" id="nextBtn">下一組 ▶</button>
+        <span class="pairinfo" id="pairInfo"></span>
+      </div>
+      <img class="vis-img" id="visImg" alt="overlay">
+      <div class="legend">
+        <span><span class="dot" style="background:#e7c84b"></span>手動 ce 標記（左圖）</span>&nbsp;&nbsp;
+        <span><span class="dot" style="background:#35c46a"></span>RANSAC inlier 配對線 / 手動 new 標記（右圖）</span>&nbsp;&nbsp;
+        <span><span class="dot" style="background:#ff5964"></span>RANSAC outlier 配對線 / 投影後標記（誤差）</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let RESULT = null;        // full /api/run response
+let curEngine = null;     // engine id shown in browser
+let curPair = 0;
+let nameBad = false;      // true when the output folder name is invalid or already exists
+
+// ---- load available engines --------------------------------------------
+async function loadEngines() {
+  try {
+    const r = await fetch("/api/devices");
+    const d = await r.json();
+    const box = $("engines");
+    box.innerHTML = "";
+    if (!d.engines.length) { box.innerHTML = '<span class="err">找不到可用引擎</span>'; return; }
+    d.engines.forEach((e, i) => {
+      const on = ["opencv", "pytorch", "ov_cpu"].includes(e.id);
+      const l = document.createElement("label");
+      l.innerHTML = `<input type="checkbox" value="${e.id}" ${on ? "checked" : ""}> ${e.label}`;
+      box.appendChild(l);
+    });
+    box.insertAdjacentHTML("beforeend",
+      `<div class="muted" style="margin-top:6px">OpenVINO 裝置: ${d.ov_devices.join(", ") || "無"}</div>`);
+  } catch (e) {
+    $("engines").innerHTML = '<span class="err">無法連線後端</span>';
+  }
+}
+
+function selectedEngines() {
+  return [...document.querySelectorAll("#engines input:checked")].map(c => c.value);
+}
+
+function refreshRunBtn() {
+  $("runBtn").disabled = !($("jsonFile").files.length && selectedEngines().length && !nameBad);
+}
+$("jsonFile").addEventListener("change", refreshRunBtn);
+$("engines").addEventListener("change", refreshRunBtn);
+
+// ---- run ----------------------------------------------------------------
+$("runBtn").addEventListener("click", async () => {
+  const f = $("jsonFile").files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("engines", selectedEngines().join(","));
+  fd.append("run_name", $("run_name").value.trim());
+  ["lg_features", "max_features", "max_dim", "min_matches", "ratio", "ransac_thresh", "ov_size"]
+    .forEach(k => fd.append(k, $(k).value));
+
+  $("runBtn").disabled = true;
+  $("status").textContent = "執行中…（首次會下載/編譯模型，OpenVINO 較久）";
+  clearResults();
+  const t0 = performance.now();
+  const timer = setInterval(() => {
+    const s = ((performance.now() - t0) / 1000).toFixed(0);
+    $("status").textContent = `執行中…已耗時 ${s}s（首次會下載/編譯模型，OpenVINO 較久）`;
+  }, 500);
+  try {
+    const r = await fetch("/api/run", { method: "POST", body: fd });
+    const d = await r.json();
+    clearInterval(timer);
+    if (!r.ok) { $("status").innerHTML = `<span class="err">錯誤: ${d.detail || r.status}</span>`; return; }
+    RESULT = d;
+    const total = ((performance.now() - t0) / 1000).toFixed(1);
+    $("status").textContent = `完成（耗時 ${total}s）→ 資料夾 runs/${d.run_id}（ce=${d.counts.ce} new=${d.counts.new} points=${d.counts.points}）`;
+    newName();  // suggest a fresh name for the next run
+    renderMetrics();
+    renderBrowser();
+  } catch (e) {
+    clearInterval(timer);
+    $("status").innerHTML = `<span class="err">請求失敗: ${e}</span>`;
+  } finally {
+    refreshRunBtn();
+  }
+});
+
+// ---- output folder name -------------------------------------------------
+async function newName() {
+  try {
+    const r = await fetch("/api/new_name");
+    const d = await r.json();
+    $("run_name").value = d.name;
+    checkName();
+  } catch (e) { /* leave field as-is */ }
+}
+let nameTimer = null;
+async function checkName() {
+  const name = $("run_name").value.trim();
+  const hint = $("nameHint");
+  if (!name) { hint.className = "namehint"; hint.textContent = "留空＝自動用時間戳命名"; nameBad = false; refreshRunBtn(); return; }
+  try {
+    const r = await fetch("/api/check_name?name=" + encodeURIComponent(name));
+    const d = await r.json();
+    if (!d.valid) { hint.className = "namehint bad"; hint.textContent = "名稱不合法（僅允許英數 _ - .）"; nameBad = true; }
+    else if (d.exists) { hint.className = "namehint bad"; hint.textContent = `資料夾已存在：${d.safe_name}`; nameBad = true; }
+    else { hint.className = "namehint ok"; hint.textContent = `可用：runs/${d.safe_name}`; nameBad = false; }
+  } catch (e) { hint.className = "namehint"; hint.textContent = ""; nameBad = false; }
+  refreshRunBtn();
+}
+$("run_name").addEventListener("input", () => {
+  clearTimeout(nameTimer);
+  nameTimer = setTimeout(checkName, 250);
+});
+$("genName").addEventListener("click", newName);
+
+// ---- metrics table ------------------------------------------------------
+// each row: [label, textFn, compareFn|null, direction]
+//   compareFn(m) -> numeric value used to pick the "best" engine (green)
+//   direction 'min' = lower is better, 'max' = higher is better
+const ROWS = [
+  ["配對成功",       m => m.error != null ? "—" : `${m.n_matched}/${m.n_total}`, null, null],
+  ["誤差平均 (px)",   m => fmt(m.err_mean_px),   m => m.err_mean_px,   "min"],
+  ["誤差中位數 (px)", m => fmt(m.err_median_px), m => m.err_median_px, "min"],
+  ["成功率 <3px",  m => m.error != null ? "—" : `${m.succ_lt3_count} (${m.succ_lt3_pct}%)`,  m => m.succ_lt3_pct,  "max"],
+  ["成功率 <5px",  m => m.error != null ? "—" : `${m.succ_lt5_count} (${m.succ_lt5_pct}%)`,  m => m.succ_lt5_pct,  "max"],
+  ["成功率 <10px", m => m.error != null ? "—" : `${m.succ_lt10_count} (${m.succ_lt10_pct}%)`, m => m.succ_lt10_pct, "max"],
+  ["速度 (ms/影像)", m => fmt(m.ms_per_image), m => m.ms_per_image, "min"],
+  ["CPU (秒)",       m => fmt(m.cpu_seconds),  null, null],
+  ["CPU (%)",        m => fmt(m.cpu_percent),  null, null],
+  ["尖峰記憶體 (MB)", m => fmt(m.peak_mem_mb),  m => m.peak_mem_mb, "min"],
+];
+function fmt(v) { return v == null ? "—" : v; }
+
+// reset both result cards back to their empty state before a new run
+function clearResults() {
+  RESULT = null; curEngine = null; curPair = 0;
+  $("metrics").innerHTML = '<span class="muted">計算中…</span>';
+  $("browserCard").classList.add("hidden");
+  $("engineTabs").innerHTML = "";
+  $("pairSelect").innerHTML = "";
+  $("pairInfo").innerHTML = "";
+  $("visImg").removeAttribute("src");
+}
+
+function renderMetrics() {
+  const engines = RESULT.engines;
+  let html = "<table><thead><tr><th>指標</th>";
+  engines.forEach(m => {
+    const log = m.log_url ? ` <a href="${m.log_url}" target="_blank" title="開啟執行 log">log</a>` : "";
+    html += `<th>${m.label}${m.error ? " ⚠" : ""}${log}</th>`;
+  });
+  html += "</tr></thead><tbody>";
+  ROWS.forEach(([name, fn, cmp, dir]) => {
+    html += `<tr><td>${name}</td>`;
+    const vals = engines.map(m => (m.error || !cmp) ? null : cmp(m));
+    const bi = bestIndex(vals, dir);
+    engines.forEach((m, i) => {
+      const cls = (i === bi && vals[i] != null) ? "best" : "";
+      html += `<td class="${cls}">${m.error ? "—" : fn(m)}</td>`;
+    });
+    html += "</tr>";
+  });
+  html += "</tbody></table>";
+  const errs = engines.filter(m => m.error);
+  if (errs.length) {
+    html += `<div class="legend err">⚠ 失敗: ${errs.map(m => m.label).join(", ")}</div>`;
+  }
+  $("metrics").innerHTML = html;
+}
+function bestIndex(vals, dir) {
+  if (!dir) return -1;
+  let bi = -1, bv = null;
+  vals.forEach((v, i) => {
+    if (v == null || isNaN(v)) return;
+    if (bv == null || (dir === "min" ? v < bv : v > bv)) { bv = v; bi = i; }
+  });
+  return bi;
+}
+
+// ---- per-pair image browser --------------------------------------------
+function renderBrowser() {
+  const engines = RESULT.engines.filter(m => !m.error && m.pairs && m.pairs.length);
+  if (!engines.length) { $("browserCard").classList.add("hidden"); return; }
+  $("browserCard").classList.remove("hidden");
+  curEngine = engines[0].id;
+  curPair = 0;
+
+  const tabs = $("engineTabs");
+  tabs.innerHTML = "";
+  engines.forEach(m => {
+    const t = document.createElement("div");
+    t.className = "tab" + (m.id === curEngine ? " active" : "");
+    t.textContent = m.label;
+    t.onclick = () => { curEngine = m.id; syncTabs(); fillPairs(); showPair(); };
+    t.dataset.id = m.id;
+    tabs.appendChild(t);
+  });
+  fillPairs();
+  showPair();
+}
+function syncTabs() {
+  [...$("engineTabs").children].forEach(t =>
+    t.classList.toggle("active", t.dataset.id === curEngine));
+}
+function engineById(id) { return RESULT.engines.find(m => m.id === id); }
+function fillPairs() {
+  const m = engineById(curEngine);
+  const sel = $("pairSelect");
+  sel.innerHTML = "";
+  m.pairs.forEach((p, i) => {
+    const e = p.error_px == null ? "no match" : `${p.error_px.toFixed(1)}px`;
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `#${i} ${p.ceFile}→${p.newFile} (${e})`;
+    sel.appendChild(o);
+  });
+  if (curPair >= m.pairs.length) curPair = 0;
+  sel.value = curPair;
+}
+function showPair() {
+  const m = engineById(curEngine);
+  const p = m.pairs[curPair];
+  $("visImg").src = `${RESULT.vis_base}/${curEngine}/${p.vis}?t=${Date.now()}`;
+  $("pairSelect").value = curPair;
+  const err = p.error_px == null
+    ? '<span class="pill err" style="background:#3a1b1e">配對失敗</span>'
+    : `<span class="pill" style="background:#123b22;color:#7be0a3">誤差 ${p.error_px.toFixed(1)} px</span>`;
+  $("pairInfo").innerHTML = `${err}
+    <span class="muted">matches=${p.n_matches} inliers=${p.n_inliers}</span>`;
+}
+$("prevBtn").onclick = () => { const m = engineById(curEngine); curPair = (curPair - 1 + m.pairs.length) % m.pairs.length; showPair(); };
+$("nextBtn").onclick = () => { const m = engineById(curEngine); curPair = (curPair + 1) % m.pairs.length; showPair(); };
+$("pairSelect").onchange = (e) => { curPair = +e.target.value; showPair(); };
+
+// ---- mode tabs: new test vs. load existing result -----------------------
+document.querySelectorAll("#modeTabs .tab").forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll("#modeTabs .tab").forEach(x => x.classList.toggle("active", x === t));
+    const mode = t.dataset.mode;
+    $("panelNew").classList.toggle("hidden", mode !== "new");
+    $("panelLoad").classList.toggle("hidden", mode !== "load");
+    if (mode === "load") loadRuns();
+  };
+});
+
+async function loadRuns() {
+  const sel = $("runSelect");
+  try {
+    const r = await fetch("/api/runs");
+    const d = await r.json();
+    sel.innerHTML = "";
+    if (!d.runs.length) {
+      sel.innerHTML = '<option value="">（runs/ 底下尚無任何結果）</option>';
+      $("loadBtn").disabled = true; return;
+    }
+    d.runs.forEach(run => {
+      const o = document.createElement("option");
+      o.value = run.run_id;
+      const dt = new Date(run.mtime * 1000).toLocaleString();
+      o.textContent = `${run.run_id} — ${run.engines.join("/")} — ${dt}`;
+      sel.appendChild(o);
+    });
+    $("loadBtn").disabled = false;
+  } catch (e) {
+    sel.innerHTML = '<option value="">無法連線後端</option>';
+    $("loadBtn").disabled = true;
+  }
+}
+$("runSelect").addEventListener("change", () => { $("loadBtn").disabled = !$("runSelect").value; });
+$("refreshRuns").addEventListener("click", loadRuns);
+$("loadBtn").addEventListener("click", async () => {
+  const rid = $("runSelect").value;
+  if (!rid) return;
+  $("loadBtn").disabled = true;
+  $("loadStatus").textContent = "載入中…";
+  try {
+    const r = await fetch("/api/result/" + encodeURIComponent(rid));
+    const d = await r.json();
+    if (!r.ok) { $("loadStatus").innerHTML = `<span class="err">錯誤: ${d.detail || r.status}</span>`; return; }
+    RESULT = d;
+    const c = d.counts ? `（ce=${d.counts.ce} new=${d.counts.new} points=${d.counts.points}）` : "";
+    $("loadStatus").textContent = `已載入 runs/${d.run_id}${c}`;
+    renderMetrics();
+    renderBrowser();
+  } catch (e) {
+    $("loadStatus").innerHTML = `<span class="err">請求失敗: ${e}</span>`;
+  } finally {
+    $("loadBtn").disabled = false;
+  }
+});
+
+loadEngines();
+newName();
+</script>
+</body>
+</html>
