@@ -1,4 +1,4 @@
-"""Loads real pseudo ground-truth assets (thermal images, YOLO C-Cover labels,
+"""Loads real pseudo ground-truth assets (thermal images, YOLO-OBB C-Cover labels,
 hotspot point annotations) used by the hotspot detection benchmark desktop UI.
 """
 
@@ -13,7 +13,7 @@ from PIL import Image
 
 _BASE_DIR = Path(__file__).resolve().parent / "pseudo_ground_truth"
 IMAGE_DIR = _BASE_DIR / "test" / "images"
-YOLO_LABEL_DIR = _BASE_DIR / "yolo_labels"
+YOLO_OBB_LABEL_DIR = _BASE_DIR / "yolo_obb_labels"
 HOTSPOT_JSON_PATH = _BASE_DIR / "hotspot_points.json"
 
 
@@ -44,26 +44,34 @@ def load_thermal_image(image_file_name: str) -> Optional[np.ndarray]:
 
 
 def load_yolo_cover_box(image_file_name: str, image_width: int, image_height: int) -> Optional[dict]:
-    """Parse the YOLO label ("classId cx cy w h", normalized) into a pixel corner box."""
-    label_path = YOLO_LABEL_DIR / (Path(image_file_name).stem + ".txt")
+    """Parse a normalized YOLO-OBB label into its four pixel-space corners."""
+    label_path = YOLO_OBB_LABEL_DIR / (Path(image_file_name).stem + ".txt")
     try:
         text = label_path.read_text(encoding="utf-8").strip()
         if not text:
             raise ValueError("label file is empty")
         parts = [float(value) for value in text.split()]
-        _, center_x_ratio, center_y_ratio, width_ratio, height_ratio = parts
-        center_x = center_x_ratio * image_width
-        center_y = center_y_ratio * image_height
-        half_width = (width_ratio * image_width) / 2
-        half_height = (height_ratio * image_height) / 2
+        if len(parts) != 9:
+            raise ValueError(f"expected 9 YOLO-OBB values, got {len(parts)}")
+        (
+            _,
+            top_left_x_ratio,
+            top_left_y_ratio,
+            bottom_left_x_ratio,
+            bottom_left_y_ratio,
+            bottom_right_x_ratio,
+            bottom_right_y_ratio,
+            top_right_x_ratio,
+            top_right_y_ratio,
+        ) = parts
         return {
-            "top_left": (center_x - half_width, center_y - half_height),
-            "top_right": (center_x + half_width, center_y - half_height),
-            "bottom_left": (center_x - half_width, center_y + half_height),
-            "bottom_right": (center_x + half_width, center_y + half_height),
+            "top_left": (top_left_x_ratio * image_width, top_left_y_ratio * image_height),
+            "top_right": (top_right_x_ratio * image_width, top_right_y_ratio * image_height),
+            "bottom_left": (bottom_left_x_ratio * image_width, bottom_left_y_ratio * image_height),
+            "bottom_right": (bottom_right_x_ratio * image_width, bottom_right_y_ratio * image_height),
         }
     except Exception as error:
-        print(f"[data_loader] Failed to load YOLO cover box for '{image_file_name}': {error}")
+        print(f"[data_loader] Failed to load YOLO-OBB cover box for '{image_file_name}': {error}")
         return None
 
 
