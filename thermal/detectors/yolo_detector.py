@@ -28,12 +28,14 @@ class YOLOv8PyTorchDetector:
         conf_threshold: float = 0.12,
         iou_threshold: float = 0.50,
         imgsz: int = 640,
+        half_precision: bool = False,
     ):
         self.model_name = model_name
         self.device = device
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.imgsz = imgsz
+        self.half_precision = half_precision and str(device).strip().lower().startswith("cuda")
         self.model = None
         self._load_model()
 
@@ -45,6 +47,16 @@ class YOLOv8PyTorchDetector:
 
         self.model = YOLO(self.model_name)
         self.model.to(self.device)
+        self._log_runtime_selection()
+
+    def _log_runtime_selection(self) -> None:
+        """Print requested device/precision for easier runtime debugging (mirrors OpenVINO detector logging)."""
+        requestedDevice = str(self.device).strip().upper() or "CPU"
+        precisionText = "FP16" if self.half_precision else "FP32"
+        print(
+            f"Using PyTorch runtime on requested device '{requestedDevice}' "
+            f"(precision: {precisionText}, model: {self.model_name})"
+        )
 
     def detect(self, thermal_image: np.ndarray) -> YOLODetectionResult:
         """Run YOLOv8 detection on thermal image."""
@@ -61,6 +73,9 @@ class YOLOv8PyTorchDetector:
             iou=self.iou_threshold,
             imgsz=self.imgsz,
             verbose=False,
+            device=self.device,
+            # Ultralytics >=8.4 replaced the "half" flag with a unified "quantize" scheme (16 = FP16)
+            quantize=16 if self.half_precision else None,
         )
 
         inference_time_ms = (time.perf_counter() - t0) * 1000.0
