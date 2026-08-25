@@ -53,7 +53,10 @@ thermal/benchmark_app/*.csv
 /annotator/extracted_hp
 /annotator/extracted_lenovo
 /annotator/ov_models
-/build
-/dist/MarkerBenchmark
 /annotator/webapp/build
 /annotator/webapp/dist
+
+# PyInstaller build artifacts (see build_hotspot_dashboard.bat)
+build/
+dist/
+*.spec
