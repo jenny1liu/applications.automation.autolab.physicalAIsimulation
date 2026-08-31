@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +18,7 @@ class OpenVINODetectionResult:
     inference_time_ms: float
     max_temperature: float
     execution_devices: tuple[str, ...]
+    detections: list[dict] = field(default_factory=list)
 
 
 class OpenVINOYOLODetector:
@@ -244,14 +245,19 @@ class OpenVINOYOLODetector:
             self._log_runtime_selection("raw runtime")
         print(f"OpenVINO precision hint status: {self.get_precision_hint_debug_text()}")
 
-    def detect(self, thermal_image: np.ndarray) -> OpenVINODetectionResult:
+    def detect(self, thermal_image: np.ndarray, temperature_image: np.ndarray | None = None) -> OpenVINODetectionResult:
         """Run OpenVINO YOLOv8 detection on thermal image."""
         if self.ultralytics_model is None and self.compiled_model is None:
             raise RuntimeError("Model not loaded")
+        if temperature_image is not None and temperature_image.shape != thermal_image.shape:
+            raise ValueError("temperature_image must have the same shape as thermal_image")
 
         if self.ultralytics_model is not None and self._can_use_ultralytics_openvino():
             try:
-                return self._detect_ultralytics_openvino(thermal_image)
+                result = self._detect_ultralytics_openvino(thermal_image)
+                if temperature_image is not None:
+                    result.max_temperature = float(np.max(temperature_image))
+                return result
             except Exception as exc:
                 # Some Ultralytics versions reject xml path-based OpenVINO models at predict time.
                 msg = str(exc).lower()
@@ -262,7 +268,10 @@ class OpenVINOYOLODetector:
                 else:
                     raise
 
-        return self._detect_raw_openvino(thermal_image)
+        result = self._detect_raw_openvino(thermal_image)
+        if temperature_image is not None:
+            result.max_temperature = float(np.max(temperature_image))
+        return result
 
     @staticmethod
     def _resolve_ultralytics_openvino_source(model_file: Path) -> Optional[str]:
@@ -364,6 +373,7 @@ class OpenVINOYOLODetector:
         inference_time_ms = (time.perf_counter() - t0) * 1000.0
         max_temp = float(np.max(thermal_image))
 
+        detections: list[dict] = []
         if not results or len(results[0].boxes) == 0:
             center_y, center_x = np.unravel_index(np.argmax(thermal_image), thermal_image.shape)
             center_x = float(center_x)
@@ -374,6 +384,7 @@ class OpenVINOYOLODetector:
             y = int(np.clip(center_y - box_h / 2, 0, max(0, thermal_image.shape[0] - box_h)))
             bbox = (x, y, box_w, box_h)
             confidence = 0.05
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
         else:
             boxes = results[0].boxes
             confs = boxes.conf.cpu().numpy()
@@ -397,7 +408,8 @@ class OpenVINOYOLODetector:
                 score = float(confs[idx]) * (0.65 + 0.35 * thermal_score)
                 scores.append(score)
 
-            best_idx = int(np.argmax(np.asarray(scores, dtype=np.float32)))
+            ranked_indices = np.argsort(np.asarray(scores, dtype=np.float32))[::-1][:2]
+            best_idx = int(ranked_indices[0])
             x1, y1, x2, y2 = xyxy[best_idx]
             x1i = int(np.clip(np.floor(x1), 0, thermal_image.shape[1] - 1))
             y1i = int(np.clip(np.floor(y1), 0, thermal_image.shape[0] - 1))
@@ -407,6 +419,22 @@ class OpenVINOYOLODetector:
             center_x, center_y = self._thermal_weighted_center(thermal_image, x1i, y1i, x2i, y2i)
             bbox = (x1i, y1i, max(1, x2i - x1i), max(1, y2i - y1i))
             confidence = float(confs[best_idx])
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
+            for candidate_idx in ranked_indices[1:]:
+                candidate_x1, candidate_y1, candidate_x2, candidate_y2 = xyxy[int(candidate_idx)]
+                candidate_x1i = int(np.clip(np.floor(candidate_x1), 0, thermal_image.shape[1] - 1))
+                candidate_y1i = int(np.clip(np.floor(candidate_y1), 0, thermal_image.shape[0] - 1))
+                candidate_x2i = int(np.clip(np.ceil(candidate_x2), candidate_x1i + 1, thermal_image.shape[1]))
+                candidate_y2i = int(np.clip(np.ceil(candidate_y2), candidate_y1i + 1, thermal_image.shape[0]))
+                candidate_center_x, candidate_center_y = self._thermal_weighted_center(
+                    thermal_image, candidate_x1i, candidate_y1i, candidate_x2i, candidate_y2i
+                )
+                detections.append({
+                    "center_x": candidate_center_x,
+                    "center_y": candidate_center_y,
+                    "bbox": (candidate_x1i, candidate_y1i, candidate_x2i - candidate_x1i, candidate_y2i - candidate_y1i),
+                    "confidence": float(confs[int(candidate_idx)]),
+                })
 
         return OpenVINODetectionResult(
             center_x=center_x,
@@ -416,6 +444,7 @@ class OpenVINOYOLODetector:
             inference_time_ms=inference_time_ms,
             max_temperature=max_temp,
             execution_devices=tuple(self._get_execution_devices()),
+            detections=detections,
         )
 
     def _detect_raw_openvino(self, thermal_image: np.ndarray) -> OpenVINODetectionResult:
@@ -460,6 +489,7 @@ class OpenVINOYOLODetector:
         if output.ndim == 1:
             output = output.reshape(1, -1)
 
+        detections: list[dict] = []
         if output.ndim != 2 or output.shape[0] == 0 or output.shape[1] < 5:
             center_y, center_x = np.unravel_index(np.argmax(thermal_image), thermal_image.shape)
             center_x = float(center_x)
@@ -470,6 +500,7 @@ class OpenVINOYOLODetector:
             y = int(np.clip(center_y - box_h / 2, 0, max(0, thermal_image.shape[0] - box_h)))
             bbox = (x, y, box_w, box_h)
             confidence = 0.05
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
         else:
             if output.shape[1] > 6:
                 class_scores = output[:, 4:]
@@ -479,7 +510,8 @@ class OpenVINOYOLODetector:
             else:
                 confidences = np.zeros(output.shape[0], dtype=np.float32)
 
-            best_idx = np.argmax(confidences)
+            ranked_indices = np.argsort(confidences)[::-1][:2]
+            best_idx = int(ranked_indices[0])
             best_det = output[best_idx]
 
             x_center, y_center, w, h = [float(v) for v in best_det[:4]]
@@ -501,6 +533,24 @@ class OpenVINOYOLODetector:
             bw = max(1, min(int(w), orig_w - x))
             bh = max(1, min(int(h), orig_h - y))
             bbox = (x, y, bw, bh)
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
+            for candidate_index in ranked_indices[1:]:
+                candidate = output[int(candidate_index)]
+                candidate_x, candidate_y, candidate_w, candidate_h = [float(value) for value in candidate[:4]]
+                candidate_x *= scale_x
+                candidate_y *= scale_y
+                candidate_w *= scale_x
+                candidate_h *= scale_y
+                candidate_left = max(0, int(candidate_x - candidate_w / 2))
+                candidate_top = max(0, int(candidate_y - candidate_h / 2))
+                candidate_box_width = max(1, min(int(candidate_w), orig_w - candidate_left))
+                candidate_box_height = max(1, min(int(candidate_h), orig_h - candidate_top))
+                detections.append({
+                    "center_x": candidate_x,
+                    "center_y": candidate_y,
+                    "bbox": (candidate_left, candidate_top, candidate_box_width, candidate_box_height),
+                    "confidence": float(confidences[int(candidate_index)]),
+                })
 
         return OpenVINODetectionResult(
             center_x=center_x,
@@ -510,6 +560,7 @@ class OpenVINOYOLODetector:
             inference_time_ms=inference_time_ms,
             max_temperature=max_temp,
             execution_devices=tuple(self._get_execution_devices()),
+            detections=detections,
         )
 
     def _prepare_thermal_input(self, thermal_image: np.ndarray) -> np.ndarray:
