@@ -19,6 +19,85 @@ class DetectionResult:
     detections: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class CoverDetectionResult:
+    polygon: list[tuple[float, float]]
+    confidence: float
+    inference_time_ms: float
+
+
+class OpenCVCoverDetector:
+    """Detect a C-Cover contour independently from hotspot detection."""
+
+    def __init__(
+        self,
+        min_area_ratio: float = 0.02,
+        top_exclusion_ratio: float = 0.18,
+        side_exclusion_ratio: float = 0.03,
+    ):
+        self.min_area_ratio = min_area_ratio
+        self.top_exclusion_ratio = top_exclusion_ratio
+        self.side_exclusion_ratio = side_exclusion_ratio
+
+    def detect(self, thermal_image: np.ndarray) -> CoverDetectionResult:
+        """Find the strongest large thermal contour and return its rotated rectangle."""
+        if thermal_image.ndim != 2 or thermal_image.size == 0:
+            raise ValueError("thermal_image must be a non-empty 2D matrix")
+
+        start_time = time.perf_counter()
+        image = thermal_image.astype(np.float32)
+        normalized = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        blurred = cv2.GaussianBlur(normalized, (5, 5), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        top_exclusion = int(round(binary.shape[0] * self.top_exclusion_ratio))
+        side_exclusion = int(round(binary.shape[1] * self.side_exclusion_ratio))
+        binary[:top_exclusion, :] = 0
+        binary[:, :side_exclusion] = 0
+        binary[:, binary.shape[1] - side_exclusion:] = 0
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        image_area = float(image.shape[0] * image.shape[1])
+        candidates = [
+            contour for contour in contours
+            if cv2.contourArea(contour) >= image_area * self.min_area_ratio
+        ]
+        if not candidates:
+            raise RuntimeError("No C-Cover contour found")
+
+        contour = max(candidates, key=cv2.contourArea)
+        contour_mask = np.zeros(binary.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        content_rows = np.count_nonzero(contour_mask, axis=0)
+        min_column_coverage = max(1, int(round(binary.shape[0] * 0.08)))
+        content_columns = np.flatnonzero(content_rows >= min_column_coverage)
+        if content_columns.size:
+            left = int(content_columns[0])
+            right = int(content_columns[-1])
+            top = int(np.min(np.where(contour_mask > 0)[0]))
+            bottom = int(np.max(np.where(contour_mask > 0)[0]))
+            rectangle = ((
+                (left + right) / 2.0,
+                (top + bottom) / 2.0,
+            ), (
+                float(max(1, right - left)),
+                float(max(1, bottom - top)),
+            ), 0.0)
+        else:
+            rectangle = cv2.minAreaRect(contour)
+        polygon = cv2.boxPoints(rectangle).astype(np.float32)
+        contour_area = float(cv2.contourArea(contour))
+        rectangle_area = max(float(rectangle[1][0] * rectangle[1][1]), 1.0)
+        confidence = float(np.clip((contour_area / rectangle_area) * (contour_area / image_area), 0.0, 1.0))
+        return CoverDetectionResult(
+            polygon=[(float(point[0]), float(point[1])) for point in polygon],
+            confidence=confidence,
+            inference_time_ms=(time.perf_counter() - start_time) * 1000.0,
+        )
+
+
 class OpenCVHotspotDetector:
     """Hotspot detection using classical OpenCV image processing."""
 

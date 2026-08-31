@@ -17,14 +17,15 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Polygon
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from hotspot_detector import data_loader
 from hotspot_detector.model_descriptions import MODEL_DESCRIPTIONS
-from thermal.detectors.opencv_detector import OpenCVHotspotDetector
-from thermal.detectors.openvino_detector import OpenVINOYOLODetector
-from thermal.detectors.yolo_detector import YOLOv8PyTorchDetector
+from thermal.detectors.c_cover_obb_detector import CCoverOBBDetector
+from thermal.detectors.opencv_detector import OpenCVCoverDetector, OpenCVHotspotDetector
 
 # ── Design tokens (kept consistent with thermal/ui.py's dark engineering theme) ──
 C: dict[str, str] = {
@@ -52,8 +53,8 @@ SHORT_MODEL_NAMES = {"opencv": "OpenCV", "pytorch": "PyTorch", "openvino": "Open
 CONFIDENCE_PASS_THRESHOLD = 85
 IOU_PASS_THRESHOLD = 0.7
 HOTSPOT_SUCCESS_DISTANCE_PX = 3.0
-OPENVINO_MODEL_PATH = Path(__file__).resolve().parent.parent / "thermal" / "yolov8n_openvino_model" / "yolov8n.xml"
-PYTORCH_MODEL_PATH = Path(__file__).resolve().parent.parent / "thermal" / "yolov8n.pt"
+PYTORCH_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "c_cover_obb" / "weights" / "best.pt"
+OPENVINO_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "c_cover_obb" / "weights" / "best_openvino_model"
 
 
 class DarkScrollbar(tk.Canvas):
@@ -290,15 +291,17 @@ class HotspotBenchmarkApp:
         self.current_model_results: dict[str, dict] = {}
         self._image_array: Optional[np.ndarray] = None
         self._temperature_array: Optional[np.ndarray] = None
-        self._openvino_detector: Optional[OpenVINOYOLODetector] = None
-        self._pytorch_detector: Optional[YOLOv8PyTorchDetector] = None
+        self._openvino_detector: Optional[CCoverOBBDetector] = None
+        self._pytorch_detector: Optional[CCoverOBBDetector] = None
         self._opencv_detector: Optional[OpenCVHotspotDetector] = None
+        self._opencv_cover_detector: Optional[OpenCVCoverDetector] = None
         self._openvino_precision_dropdown: Optional[RuntimeDropdown] = None
         self._pytorch_precision_dropdown: Optional[RuntimeDropdown] = None
         self._status_blink_active = False
         self._status_blink_step = 0
         self._status_display_text = "Ready"
         self._benchmark_running = False
+        self._openvino_warmup_started = False
 
         self._build_header()
         self._build_body()
@@ -311,6 +314,7 @@ class HotspotBenchmarkApp:
             # "Run All Images", so it's clear that nothing has been computed yet.
             self.image_index_var.set(f"1 / {len(self.image_list)}")
             self._show_placeholder_state()
+            self.root.after(300, self._start_openvino_warmup)
 
 
     def _set_window_icon(self) -> None:
@@ -753,13 +757,14 @@ class HotspotBenchmarkApp:
         bg: str = C["header"],
         fg: str = C["text"],
         command: Optional[Callable[[], None]] = None,
+        bold: bool = False,
     ) -> tk.Checkbutton:
         callback = command if command is not None else self._redraw_panels
         return tk.Checkbutton(
             parent, text=text, variable=var, command=callback,
             bg=bg, fg=fg, selectcolor=bg,
             activebackground=bg, activeforeground=fg,
-            font=(FF, 8), highlightthickness=0, bd=0,
+            font=(FF, 8, "bold") if bold else (FF, 8), highlightthickness=0, bd=0,
         )
 
     def _on_overlay_toggle(self) -> None:
@@ -855,6 +860,13 @@ class HotspotBenchmarkApp:
 
         overlay_row = tk.Frame(overlay_toolbar, bg="#111B2A", height=32)
         overlay_row_window = overlay_toolbar.create_window(1, 21, window=overlay_row, anchor="w", height=32)
+        tk.Label(
+            overlay_row,
+            text="C-Cover Detection",
+            bg="#111B2A",
+            fg=C["text"],
+            font=(FF, 11, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 14), pady=0)
 
         def draw_overlay_toolbar(event) -> None:
             try:
@@ -888,10 +900,10 @@ class HotspotBenchmarkApp:
 
         overlay_toolbar.bind("<Configure>", draw_overlay_toolbar)
         options_group = tk.Frame(overlay_row, bg="#111B2A")
-        options_group.place(relx=0.5, rely=0.5, anchor="center")
+        options_group.pack(side=tk.LEFT, pady=2)
         tk.Label(
             options_group,
-            text="IR Thermal Display Options",
+            text="Display Options",
             bg="#111B2A",
             fg=C["muted"],
             font=(FF, 8, "bold"),
@@ -917,6 +929,7 @@ class HotspotBenchmarkApp:
                 bg="#111B2A",
                 fg=groundTruthColor,
                 command=self._on_overlay_toggle,
+                bold=True,
             ).pack(side=tk.LEFT, padx=(0, 5), pady=3)
             self._make_checkbox(
                 group,
@@ -925,11 +938,12 @@ class HotspotBenchmarkApp:
                 bg="#111B2A",
                 fg=predictedColor,
                 command=self._on_overlay_toggle,
+                bold=True,
             ).pack(side=tk.LEFT, pady=3)
 
         add_overlay_group(
             "C-Cover", self.overlay_vars["show_gt_cover"], self.overlay_vars["show_cover"],
-            C["cover_gt"], C["cover_predicted"]
+            C["muted"], C["cover_predicted"]
         )
 
         panels_row = tk.Frame(thermal_section, bg=C["thermal_surface"])
@@ -1151,7 +1165,7 @@ class HotspotBenchmarkApp:
             anchor=tk.W, pady=(0, 4)
         )
 
-        figure = plt.Figure(figsize=(5.6, 4.2), dpi=100, facecolor=C["thermal_surface"])
+        figure = plt.Figure(figsize=(3.36, 2.52), dpi=100, facecolor=C["thermal_surface"])
         axes = figure.add_subplot(111)
         figure.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
         axes.set_facecolor(C["thermal_surface"])
@@ -1162,7 +1176,8 @@ class HotspotBenchmarkApp:
         canvas_widget_holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         canvas = FigureCanvasTkAgg(figure, master=canvas_widget_holder)
         canvas_widget = canvas.get_tk_widget()
-        canvas_widget.pack(fill=tk.BOTH, expand=True)
+        canvas_widget.config(width=336, height=252)
+        canvas_widget.pack(fill=tk.NONE, expand=False, anchor=tk.CENTER)
         # Bind with model_key captured per-canvas so each panel zooms/pans independently.
         canvas_widget.bind("<MouseWheel>", lambda event, mk=model_key: self._on_model_mousewheel(event, mk))
         # Matplotlib registers its Windows wheel adapter directly on the root widget.
@@ -1289,25 +1304,39 @@ class HotspotBenchmarkApp:
             messagebox.showerror("Load Error", str(error))
             self._set_status("Error", C["error"])
 
-    def _get_openvino_detector(self) -> OpenVINOYOLODetector:
+    def _get_openvino_detector(self) -> CCoverOBBDetector:
         if self._openvino_detector is None:
-            if not OPENVINO_MODEL_PATH.is_file():
+            if not OPENVINO_MODEL_PATH.is_dir():
                 raise FileNotFoundError(f"OpenVINO model not found: {OPENVINO_MODEL_PATH}")
-            self._openvino_detector = OpenVINOYOLODetector(
+            self._openvino_detector = CCoverOBBDetector(
                 model_path=str(OPENVINO_MODEL_PATH),
                 device=self.openvinoDeviceVar.get(),
-                inference_precision_hint=self.openvinoPrecisionVar.get(),
+                conf_threshold=0.5,
             )
         return self._openvino_detector
 
-    def _get_pytorch_detector(self) -> YOLOv8PyTorchDetector:
+    def _start_openvino_warmup(self) -> None:
+        """Warm up OpenVINO in the background so first-run latency stays responsive."""
+        if self._openvino_warmup_started:
+            return
+        self._openvino_warmup_started = True
+
+        def warmup_worker() -> None:
+            try:
+                self._get_openvino_detector().warmup()
+            except Exception as error:
+                print(f"[ui] OpenVINO warm-up failed: {error}")
+
+        threading.Thread(target=warmup_worker, daemon=True).start()
+
+    def _get_pytorch_detector(self) -> CCoverOBBDetector:
         if self._pytorch_detector is None:
             if not PYTORCH_MODEL_PATH.is_file():
                 raise FileNotFoundError(f"PyTorch model not found: {PYTORCH_MODEL_PATH}")
-            self._pytorch_detector = YOLOv8PyTorchDetector(
-                model_name=str(PYTORCH_MODEL_PATH),
+            self._pytorch_detector = CCoverOBBDetector(
+                model_path=str(PYTORCH_MODEL_PATH),
                 device=self.pytorchDeviceVar.get().lower(),
-                half_precision=self.pytorchPrecisionVar.get().upper() == "FP16",
+                conf_threshold=0.5,
             )
         return self._pytorch_detector
 
@@ -1315,6 +1344,11 @@ class HotspotBenchmarkApp:
         if self._opencv_detector is None:
             self._opencv_detector = OpenCVHotspotDetector()
         return self._opencv_detector
+
+    def _get_opencv_cover_detector(self) -> OpenCVCoverDetector:
+        if self._opencv_cover_detector is None:
+            self._opencv_cover_detector = OpenCVCoverDetector()
+        return self._opencv_cover_detector
 
     @staticmethod
     def _to_thermal_matrix(image_array: np.ndarray) -> np.ndarray:
@@ -1398,6 +1432,47 @@ class HotspotBenchmarkApp:
         }
 
     @staticmethod
+    def _make_polygon_cover_result(
+        polygon_points: list[tuple[float, float]],
+        confidence: float,
+        gt_cover_box: dict,
+    ) -> dict:
+        """Calculate C-Cover IoU from a detector's rotated four-point polygon."""
+        if len(polygon_points) != 4:
+            raise ValueError("C-Cover polygon must contain four points")
+        points_by_y = sorted(polygon_points, key=lambda point: point[1])
+        top_left, top_right = sorted(points_by_y[:2], key=lambda point: point[0])
+        bottom_left, bottom_right = sorted(points_by_y[2:], key=lambda point: point[0])
+        predicted_box = {
+            "top_left": top_left,
+            "top_right": top_right,
+            "bottom_right": bottom_right,
+            "bottom_left": bottom_left,
+        }
+        predicted_polygon = np.asarray(
+            [top_left, top_right, bottom_right, bottom_left], dtype=np.float32,
+        )
+        ground_truth_polygon = np.asarray(
+            [
+                gt_cover_box["top_left"], gt_cover_box["top_right"],
+                gt_cover_box["bottom_right"], gt_cover_box["bottom_left"],
+            ],
+            dtype=np.float32,
+        )
+        intersection_area, _ = cv2.intersectConvexConvex(predicted_polygon, ground_truth_polygon)
+        predicted_area = abs(float(cv2.contourArea(predicted_polygon)))
+        ground_truth_area = abs(float(cv2.contourArea(ground_truth_polygon)))
+        union_area = predicted_area + ground_truth_area - float(intersection_area)
+        iou = float(intersection_area / union_area) if union_area > 0 else 0.0
+        confidence_percent = float(np.clip(confidence * 100.0, 0.0, 100.0))
+        return {
+            "detected_cover_box": predicted_box,
+            "confidence": round(confidence_percent, 1),
+            "iou": round(iou, 2),
+            "status": "PASS" if iou >= IOU_PASS_THRESHOLD else "FAIL",
+        }
+
+    @staticmethod
     def _limit_predictions_to_gt_count(predictions: list[dict], gt_hotspots: list[list[float]]) -> list[dict]:
         """Keep at most one prediction per available ground-truth hotspot."""
         return predictions[:min(len(predictions), len(gt_hotspots), 2)]
@@ -1438,46 +1513,35 @@ class HotspotBenchmarkApp:
         return slots
 
     def _run_openvino_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
-        detector_result = self._get_openvino_detector().detect(self._to_thermal_matrix(image_array), temperature_array)
-        predictions = self._prepare_predictions(detector_result, temperature_array)
-        predictions = self._limit_predictions_to_gt_count(predictions, gt_hotspots)
-        if not gt_hotspots:
-            return {
-                "hotspots": [],
-                "success_rate": 0.0,
-                "inference_time_ms": detector_result.inference_time_ms,
-                "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
-                "runtime_device": self._get_openvino_detector().get_execution_device_text(),
-                "runtime_precision": self._get_openvino_detector().applied_precision_hint,
-            }
-
-        comparison_slots = self._make_comparison_slots(
-            predictions, gt_hotspots
-        )
+        del temperature_array, gt_hotspots
+        detector_result = self._get_openvino_detector().detect(image_array)
         return {
-            "hotspots": comparison_slots,
-            "cover_result": self._make_model_cover_result(detector_result, image_array.shape, gt_cover_box),
-            "success_rate": round(100 * sum(slot["is_success"] for slot in comparison_slots) / len(gt_hotspots), 1),
+            "hotspots": [],
+            "cover_result": self._make_polygon_cover_result(
+                detector_result.polygon, detector_result.confidence, gt_cover_box,
+            ),
+            "success_rate": 0.0,
             "inference_time_ms": detector_result.inference_time_ms,
             "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
-            "runtime_device": self._get_openvino_detector().get_execution_device_text(),
-            "runtime_precision": self._get_openvino_detector().applied_precision_hint,
+            "runtime_device": detector_result.runtime_device,
+            "runtime_precision": self.openvinoPrecisionVar.get(),
         }
 
     def _run_opencv_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
         ordered_cover_points = self._order_cover_corners(gt_cover_box)
         cover_polygon = [ordered_cover_points[corner] for corner in ("TL", "TR", "BR", "BL")]
-        detector_result = self._get_opencv_detector().detect(
+        hotspot_result = self._get_opencv_detector().detect(
             self._to_thermal_matrix(image_array), temperature_array, roi_polygon=cover_polygon
         )
-        predictions = self._prepare_predictions(detector_result, temperature_array)
+        cover_detector_result = self._get_opencv_cover_detector().detect(self._to_thermal_matrix(image_array))
+        predictions = self._prepare_predictions(hotspot_result, temperature_array)
         predictions = self._limit_predictions_to_gt_count(predictions, gt_hotspots)
         if not gt_hotspots:
             return {
                 "hotspots": [],
                 "success_rate": 0.0,
-                "inference_time_ms": detector_result.inference_time_ms,
-                "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
+                "inference_time_ms": cover_detector_result.inference_time_ms,
+                "fps": round(1000 / max(cover_detector_result.inference_time_ms, 0.001), 1),
             }
 
         comparison_slots = self._make_comparison_slots(
@@ -1485,31 +1549,23 @@ class HotspotBenchmarkApp:
         )
         return {
             "hotspots": comparison_slots,
-            "cover_result": self._make_model_cover_result(detector_result, image_array.shape, gt_cover_box),
+            "cover_result": self._make_polygon_cover_result(
+                cover_detector_result.polygon, cover_detector_result.confidence, gt_cover_box,
+            ),
             "success_rate": round(100 * sum(slot["is_success"] for slot in comparison_slots) / len(gt_hotspots), 1),
-            "inference_time_ms": detector_result.inference_time_ms,
-            "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
+            "inference_time_ms": cover_detector_result.inference_time_ms,
+            "fps": round(1000 / max(cover_detector_result.inference_time_ms, 0.001), 1),
         }
 
     def _run_pytorch_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
-        detector_result = self._get_pytorch_detector().detect(self._to_thermal_matrix(image_array), temperature_array)
-        predictions = self._prepare_predictions(detector_result, temperature_array)
-        predictions = self._limit_predictions_to_gt_count(predictions, gt_hotspots)
-        if not gt_hotspots:
-            return {
-                "hotspots": [],
-                "success_rate": 0.0,
-                "inference_time_ms": detector_result.inference_time_ms,
-                "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
-            }
-
-        comparison_slots = self._make_comparison_slots(
-            predictions, gt_hotspots
-        )
+        del temperature_array, gt_hotspots
+        detector_result = self._get_pytorch_detector().detect(image_array)
         return {
-            "hotspots": comparison_slots,
-            "cover_result": self._make_model_cover_result(detector_result, image_array.shape, gt_cover_box),
-            "success_rate": round(100 * sum(slot["is_success"] for slot in comparison_slots) / len(gt_hotspots), 1),
+            "hotspots": [],
+            "cover_result": self._make_polygon_cover_result(
+                detector_result.polygon, detector_result.confidence, gt_cover_box,
+            ),
+            "success_rate": 0.0,
             "inference_time_ms": detector_result.inference_time_ms,
             "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
         }
@@ -1533,14 +1589,19 @@ class HotspotBenchmarkApp:
         cover_box: dict,
         gt_hotspots: list[list[float]],
     ) -> None:
-        """Run only OpenCV hotspot detection for one image."""
-        del image_file, cover_box
-        opencv_result = self._run_opencv_result(image_array, temperature_array, gt_hotspots, self.current_cover_box)
-        self._all_image_model_results = {"opencv": {"opencv": opencv_result}}
-        self._all_image_cover_results = {}
-        self.current_model_results = {"opencv": opencv_result}
-        self.current_hotspot_result = opencv_result
-        self.current_cover_result = None
+        """Run all three detection models for one image."""
+        model_results = {
+            "opencv": self._run_opencv_result(image_array, temperature_array, gt_hotspots, cover_box),
+            "pytorch": self._run_pytorch_result(image_array, temperature_array, gt_hotspots, cover_box),
+            "openvino": self._run_openvino_result(image_array, temperature_array, gt_hotspots, cover_box),
+        }
+        self._all_image_model_results = {image_file: model_results}
+        self._all_image_cover_results = {
+            image_file: model_results["opencv"].get("cover_result"),
+        }
+        self.current_model_results = model_results
+        self.current_hotspot_result = model_results["opencv"]
+        self.current_cover_result = self._all_image_cover_results[image_file]
         self.dataset_summary = {}
 
     def _load_cached_results_for_image(self, image_file: str) -> None:
@@ -1684,13 +1745,24 @@ class HotspotBenchmarkApp:
                 "avg_inference_time_ms": avg_inference_time,
                 "avg_fps": avg_fps,
                 "avg_iou": avg_iou,
+                "avg_cover_error_percent": round(100.0 - avg_iou * 100.0, 1) if avg_iou is not None else None,
                 "map_at_3px": map_at_3px,
                 "overall_score": overall_score,
             }
         summary["hotspot"] = {
             "avg_distance": round(float(np.mean(hotspot_distances)), 2) if hotspot_distances else None,
+            "median_error": round(float(np.median(hotspot_distances)), 2) if hotspot_distances else None,
+            "worst_error": round(float(np.max(hotspot_distances)), 2) if hotspot_distances else None,
+            "median_error_percent": round(float(np.median(hotspot_normalized_distances)) * 100.0, 3)
+            if hotspot_normalized_distances else None,
+            "worst_error_percent": round(float(np.max(hotspot_normalized_distances)) * 100.0, 3)
+            if hotspot_normalized_distances else None,
             "avg_normalized_distance_percent": round(float(np.mean(hotspot_normalized_distances)) * 100.0, 3)
             if hotspot_normalized_distances else None,
+            "success_rate": round(
+                100.0 * (hotspot_result_counts["Perfect Hit"] + hotspot_result_counts["Acceptable Hit"])
+                / sum(hotspot_result_counts.values()), 1
+            ) if sum(hotspot_result_counts.values()) else None,
             "avg_temperature_delta": round(float(np.mean(hotspot_temperature_deltas)), 2)
             if hotspot_temperature_deltas else None,
             "pck_at_5px": round(100.0 * hotspot_pck_hits / hotspot_pck_total, 1)
@@ -1822,6 +1894,16 @@ class HotspotBenchmarkApp:
                 model_key: {"center_x": width / 2, "center_y": height / 2, "scale": 1.0}
                 for model_key in MODEL_KEYS
             }
+            opencv_result = self.current_model_results.get("opencv", {})
+            opencv_description = self.model_description_vars.get("opencv")
+            if opencv_description is not None:
+                if not opencv_result:
+                    opencv_description.set("Paused")
+                else:
+                    opencv_description.set(
+                        f"Method: Threshold + contours | Latency: "
+                        f'{opencv_result.get("inference_time_ms", 0.0):.1f} ms'
+                    )
             openvino_result = self.current_model_results.get("openvino", {})
             openvino_description = self.model_description_vars.get("openvino")
             if openvino_description is not None:
@@ -1845,11 +1927,6 @@ class HotspotBenchmarkApp:
                         f"Device: {self.pytorchDeviceVar.get()} | Precision: {self.pytorchPrecisionVar.get()} | "
                         f"Latency: {pytorch_result.get('inference_time_ms', 0.0):.1f} ms"
                     )
-            if not openvino_result or not pytorch_result:
-                for model_key in MODEL_KEYS:
-                    description = self.model_description_vars.get(model_key)
-                    if description is not None:
-                        description.set("Paused")
             self._redraw_panels()
             self.image_index_var.set(f"{self.image_index + 1} / {len(self.image_list)}")
             self._set_check_results_active(True)
@@ -1914,7 +1991,7 @@ class HotspotBenchmarkApp:
         cover_result = result.get("cover_result") if result else None
 
         if overlays["show_gt_cover"].get() and self.current_cover_box:
-            self._draw_cover_polygon(axes, self.current_cover_box, color=C["cover_gt"], dashed=False)
+            self._draw_cover_polygon(axes, self.current_cover_box, color=C["muted"], dashed=False)
         if overlays["show_cover"].get() and cover_result:
             self._draw_cover_polygon(axes, cover_result["detected_cover_box"], color=C["cover_predicted"], dashed=False)
 
@@ -2136,52 +2213,42 @@ class HotspotBenchmarkApp:
         if not result:
             return
 
-        tk.Label(frame, text="C-Cover OBB Metrics", bg=C["thermal_surface"], fg=C["text"], font=(FF, 12, "bold")).pack(anchor=tk.W, pady=(0, 3))
+        tk.Label(frame, text="Detection Metrics", bg=C["thermal_surface"], fg=C["text"], font=(FF, 12, "bold")).pack(anchor=tk.W, pady=(0, 3))
 
         cover_result = result.get("cover_result")
         if cover_result is None:
             tk.Label(frame, text="No C-Cover result.", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W)
             return
-        tk.Label(frame, text=f'GT / Predicted corners: 4 / 4', bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W)
-        tk.Label(frame, text=f'Confidence: {cover_result["confidence"]}%   IoU: {cover_result["iou"]}',
-                 bg=C["thermal_surface"], fg=C["cover_predicted"], font=(FF, 10, "bold")).pack(anchor=tk.W)
-        tk.Label(frame, text=f'Status: {cover_result["status"]}', bg=C["thermal_surface"],
-                 fg=C["success"] if cover_result["status"] == "PASS" else C["error"],
-                 font=(FF, 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        try:
+            iou = float(cover_result["iou"])
+            error = max(0.0, 100.0 - iou * 100.0)
+            metric_values = (
+                ("Accuracy (IoU)", f"{iou * 100.0:.1f}%", C["cover_predicted"]),
+                ("Error", f"{error:.1f}%", C["error"]),
+                ("Latency", f'{float(result["inference_time_ms"]):.1f} ms', C["muted"]),
+                ("FPS", f'{float(result["fps"]):.1f}', C["muted"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            tk.Label(frame, text=f"Metrics unavailable: {error}", bg=C["thermal_surface"],
+                     fg=C["error"], font=(FF, 10)).pack(anchor=tk.W)
+            return
 
-        metrics_content = tk.Frame(frame, bg=C["thermal_surface"])
-        metrics_content.pack(fill=tk.BOTH, expand=True)
-        metrics_content.grid_columnconfigure(0, weight=1)
-        metrics_content.grid_columnconfigure(1, weight=0, minsize=1)
-        metrics_content.grid_columnconfigure(2, weight=1)
-
-        cover_column = tk.Frame(metrics_content, bg=C["thermal_surface"])
-        cover_column.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        tk.Frame(metrics_content, bg=C["border"], width=1).grid(row=0, column=1, sticky="ns")
-        stats_column = tk.Frame(metrics_content, bg=C["thermal_surface"])
-        stats_column.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
-
-        tk.Label(cover_column, text="GT: 4 corners", bg=C["thermal_surface"], fg=C["cover_gt"], font=(FF, 10, "bold")).pack(anchor=tk.W)
-        tk.Label(cover_column, text="Predicted: 4 corners", bg=C["thermal_surface"], fg=C["cover_predicted"], font=(FF, 10, "bold")).pack(anchor=tk.W)
-
-        stat_row = tk.Frame(stats_column, bg=C["thermal_surface"])
-        stat_row.pack(fill=tk.X)
-        tk.Label(stat_row, text="•", bg=C["thermal_surface"], fg=self._success_rate_color(result["success_rate"]), font=(FF, 10, "bold")).pack(side=tk.LEFT, padx=(0, 3))
-        tk.Label(stat_row, text="Success Rate", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(side=tk.LEFT)
-        tk.Label(stat_row, text=f'{result["success_rate"]}%', bg=C["thermal_surface"],
-                 fg=self._success_rate_color(result["success_rate"]), font=(FF, 11, "bold")).pack(side=tk.RIGHT)
-
-        time_row = tk.Frame(stats_column, bg=C["thermal_surface"])
-        time_row.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(time_row, text="•", bg=C["thermal_surface"], fg=C["text"], font=(FF, 10, "bold")).pack(side=tk.LEFT, padx=(0, 3))
-        tk.Label(time_row, text="Inference Time", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(side=tk.LEFT)
-        tk.Label(time_row, text=f'{result["inference_time_ms"]:.1f} ms', bg=C["thermal_surface"], fg=C["text"], font=(FF, 11)).pack(side=tk.RIGHT)
-
-        fps_row = tk.Frame(stats_column, bg=C["thermal_surface"])
-        fps_row.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(fps_row, text="•", bg=C["thermal_surface"], fg=C["warning"], font=(FF, 10, "bold")).pack(side=tk.LEFT, padx=(0, 3))
-        tk.Label(fps_row, text="FPS", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(side=tk.LEFT)
-        tk.Label(fps_row, text=f'{result["fps"]}', bg=C["thermal_surface"], fg=C["text"], font=(FF, 11)).pack(side=tk.RIGHT)
+        metrics_grid = tk.Frame(frame, bg=C["thermal_surface"])
+        metrics_grid.pack(fill=tk.X, pady=(2, 0))
+        metrics_grid.columnconfigure(0, weight=1, uniform="model_metric")
+        metrics_grid.columnconfigure(1, weight=1, uniform="model_metric")
+        for index, (label, value, color) in enumerate(metric_values):
+            metric_cell = tk.Frame(metrics_grid, bg=C["thermal_surface"])
+            metric_cell.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 10), pady=3)
+            tk.Label(metric_cell, text=label, bg=C["thermal_surface"], fg=C["muted"],
+                     font=(FF, 9)).pack(anchor=tk.W)
+            tk.Label(metric_cell, text=value, bg=C["thermal_surface"], fg=color,
+                     font=(FF, 11, "bold")).pack(anchor=tk.W)
+        tk.Label(
+            frame,
+            text="IoU measures predicted and ground-truth C-Cover overlap.",
+            bg=C["thermal_surface"], fg=C["muted"], font=(FF, 8),
+        ).pack(anchor=tk.W, pady=(4, 0))
 
     def _populate_detection_status(self) -> None:
         """Render the OpenCV hotspot card with result, heatmap, and comparison table."""
@@ -2223,48 +2290,34 @@ class HotspotBenchmarkApp:
                      font=(FF, 8, "bold"), padx=6, pady=2).pack(side=tk.LEFT)
             tk.Label(card, text=result_name, bg=badge_color, fg="white",
                      font=(FF, 8, "bold"), padx=6, pady=2).pack(side=tk.LEFT)
-        quality_values = metric_values.get("Match Quality", "N/A").split(" / ")
-        quality_panel = tk.Frame(result_panel, bg=C["thermal_surface"])
-        quality_panel.pack(side=tk.RIGHT, padx=8, pady=3)
-        tk.Label(quality_panel, text="Match Quality", bg=C["thermal_surface"], fg=C["muted"],
-                 font=(FF, 8, "bold")).pack(side=tk.LEFT, padx=(0, 5))
-        for index, quality in enumerate(quality_values, start=1):
-            if quality == "N/A":
-                continue
-            try:
-                quality_value = float(quality.rstrip("%"))
-            except ValueError:
-                quality_value = 0.0
-            quality_color = (
-                C["success"] if quality_value >= 99.0
-                else C["warning"] if quality_value >= 97.5
-                else C["error"]
-            )
-            quality_badge = tk.Frame(
-                quality_panel, bg=quality_color,
-                highlightbackground=quality_color, highlightthickness=1,
-            )
-            quality_badge.pack(side=tk.LEFT, padx=(0, 5))
-            tk.Label(
-                quality_badge, text=f"#{index} {quality}", bg=quality_color, fg="white",
-                font=(FF, 8, "bold"), padx=6, pady=2,
-            ).pack()
 
         canvas_area = tk.Frame(
             content, bg=C["thermal_surface"],
             highlightbackground=C["border"], highlightthickness=1,
         )
-        canvas_area.pack(fill=tk.X, pady=(0, 1))
-        canvas_area.configure(height=240)
-        canvas_area.pack_propagate(False)
-        heatmap_area = tk.Frame(canvas_area, bg=C["thermal_surface"])
-        heatmap_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(heatmap_area, bg=C["thermal_surface"], width=520, height=240, highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas_area.pack(fill=tk.BOTH, expand=True, pady=(0, 1))
+        canvas_area.grid_columnconfigure(0, weight=0)
+        canvas_area.grid_columnconfigure(1, weight=0)
+        canvas_area.grid_columnconfigure(2, weight=0)
+        canvas_area.grid_rowconfigure(0, weight=1)
+        left_corner_labels = tk.Frame(canvas_area, width=97, bg=C["thermal_surface"])
+        left_corner_labels.grid(row=0, column=0, sticky="ns")
+        left_corner_labels.pack_propagate(False)
+        right_corner_labels = tk.Frame(canvas_area, width=97, bg=C["thermal_surface"])
+        right_corner_labels.grid(row=0, column=2, sticky="ns")
+        right_corner_labels.pack_propagate(False)
+        heatmap_area = tk.Frame(canvas_area, width=312, height=180, bg=C["thermal_surface"])
+        heatmap_area.grid(row=0, column=1, sticky="nw")
+        heatmap_area.pack_propagate(False)
+        canvas = tk.Canvas(
+            heatmap_area, bg=C["thermal_surface"], width=312, height=180,
+            highlightthickness=0,
+        )
+        canvas.pack(fill=tk.NONE, expand=False, anchor=tk.NW)
         self._build_hotspot_zoom_control(heatmap_area)
         canvas.update_idletasks()
-        width = max(420, canvas.winfo_width())
-        height = max(220, canvas.winfo_height())
+        width = max(312, canvas.winfo_width())
+        height = max(180, canvas.winfo_height())
         canvas.bind("<MouseWheel>", self._on_hotspot_zoom_scroll)
         canvas.bind("<ButtonPress-1>", self._on_hotspot_pan_press)
         canvas.bind("<B1-Motion>", self._on_hotspot_pan_motion)
@@ -2277,7 +2330,7 @@ class HotspotBenchmarkApp:
         )
         bottom_table.pack(fill=tk.X, pady=(4, 0))
         table_headers = ("Hotspot", "GT", "Pred", "Dist (px)", "Normalized Dist (%)", "Result")
-        table_widths = (14, 14, 14, 14, 16, 14)
+        table_widths = (12, 12, 12, 12, 16, 12)
         for column, header in enumerate(table_headers):
             tk.Label(
                 bottom_table, text=header, bg=C["thermal_surface"], fg=C["muted"],
@@ -2297,10 +2350,29 @@ class HotspotBenchmarkApp:
                 result_values[row_index - 1].split(": ", 1)[-1]
                 if row_index <= len(result_values) else "N/A",
             )
+            result_color = {
+                "Perfect Hit": C["success"],
+                "Acceptable Hit": C["warning"],
+                "Miss": C["error"],
+            }.get(table_values[5], C["muted"])
             for column, value in enumerate(table_values):
+                if column == 4 and " (" in value:
+                    normalized_value, condition = value.split(" (", 1)
+                    normalized_cell = tk.Frame(bottom_table, bg=C["thermal_surface"], width=table_widths[column] * 8)
+                    normalized_cell.grid(row=row_index, column=column, sticky="w", padx=(4, 0))
+                    normalized_cell.grid_propagate(False)
+                    tk.Label(
+                        normalized_cell, text=normalized_value, bg=C["thermal_surface"],
+                        fg=C["cover_predicted"], font=(FF, 8, "bold"), anchor="w",
+                    ).pack(side=tk.LEFT)
+                    tk.Label(
+                        normalized_cell, text=f"({condition}", bg=C["thermal_surface"],
+                        fg=result_color, font=(FF, 8, "bold"), anchor="w",
+                    ).pack(side=tk.LEFT)
+                    continue
                 tk.Label(
                     bottom_table, text=value, bg=C["thermal_surface"],
-                    fg=C["cover_gt"] if column == 1 else C["cover_predicted"] if column in (2, 3, 4, 5) else C["muted"],
+                    fg=C["muted"] if column == 1 else "#FFD54F" if column == 3 else result_color if column == 5 else C["cover_predicted"] if column in (2, 4) else C["muted"],
                     font=(FF, 8, "bold"), width=table_widths[column], anchor="w",
                 ).grid(row=row_index, column=column, sticky="w", padx=(4, 0))
 
@@ -2321,19 +2393,76 @@ class HotspotBenchmarkApp:
         span_y = max(1.0, max_y - min_y)
         center_data_x = (min_x + max_x) / 2.0
         center_data_y = (min_y + max_y) / 2.0
-        left_clearance = 12.0
-        zoom_clearance = 56.0
+        left_clearance = 16.0
+        zoom_clearance = 49.0
         center_canvas_x = left_clearance + (width - left_clearance - zoom_clearance) / 2.0
         center_canvas_y = height / 2.0 + 4.0
         available_width = max(1.0, width - left_clearance - zoom_clearance)
-        available_height = max(1.0, height - 38.0)
-        scale = min(available_width / span_x, available_height / span_y) * 0.88 * self._hotspot_zoom_scale
+        available_height = max(1.0, height - 18.0)
+        scale = min(available_width / span_x, available_height / span_y) * 0.96 * self._hotspot_zoom_scale
 
         def map_point(point: tuple[float, float]) -> tuple[float, float]:
             return (
                 center_canvas_x + (float(point[0]) - center_data_x) * scale + self._hotspot_pan_offset[0],
                 center_canvas_y + (float(point[1]) - center_data_y) * scale + self._hotspot_pan_offset[1],
             )
+
+        hover_popup: dict[str, Optional[tk.Toplevel]] = {"window": None}
+        hover_regions: list[tuple[float, float, str]] = []
+        active_hover_text: dict[str, str | None] = {"text": None}
+
+        def show_marker_popup(text: str, marker_x: float, marker_y: float) -> None:
+            if active_hover_text["text"] == text and hover_popup["window"] is not None:
+                return
+            try:
+                popup = hover_popup["window"]
+                if popup is not None:
+                    popup.destroy()
+                popup = tk.Toplevel(canvas)
+                popup.overrideredirect(True)
+                popup.attributes("-topmost", True)
+                tk.Label(
+                    popup, text=text, bg="#0B0E16", fg=C["text"], font=(FF, 8),
+                    padx=6, pady=3, highlightbackground=C["border"], highlightthickness=1,
+                ).pack()
+                popup.update_idletasks()
+                popup.geometry(
+                    f"+{canvas.winfo_rootx() + int(marker_x) + 10}+"
+                    f"{canvas.winfo_rooty() + int(marker_y) + 10}"
+                )
+                hover_popup["window"] = popup
+                active_hover_text["text"] = text
+            except tk.TclError:
+                hover_popup["window"] = None
+                active_hover_text["text"] = None
+
+        def hide_marker_popup(_event=None) -> None:
+            popup = hover_popup["window"]
+            if popup is not None:
+                popup.destroy()
+                hover_popup["window"] = None
+            active_hover_text["text"] = None
+
+        def bind_marker_hover(item_ids: list[int], text: str, marker_x: float, marker_y: float) -> None:
+            hover_regions.append((marker_x, marker_y, text))
+
+            for item_id in item_ids:
+                canvas.tag_bind(
+                    item_id, "<Enter>",
+                    lambda _event, marker_text=text, px=marker_x, py=marker_y: show_marker_popup(marker_text, px, py),
+                    add="+",
+                )
+                canvas.tag_bind(item_id, "<Leave>", hide_marker_popup, add="+")
+
+        def on_canvas_motion(event) -> None:
+            for marker_x, marker_y, text in hover_regions:
+                if abs(float(event.x) - marker_x) <= 9 and abs(float(event.y) - marker_y) <= 9:
+                    show_marker_popup(text, marker_x, marker_y)
+                    return
+            hide_marker_popup()
+
+        canvas.bind("<Motion>", on_canvas_motion, add="+")
+        canvas.bind("<Leave>", hide_marker_popup, add="+")
 
         label_font = tkfont.Font(family=FF, size=8, weight="bold")
         label_boxes: list[tuple[float, float, float, float]] = []
@@ -2347,9 +2476,11 @@ class HotspotBenchmarkApp:
             allowed_polygon: list[tuple[float, float]] | None = None,
             background: str | None = None,
             border: str | None = None,
+            min_width: float = 0.0,
+            keep_inside: bool = False,
         ) -> None:
             """Place a label at the first available position without overlap."""
-            text_width = float(label_font.measure(text))
+            text_width = max(float(label_font.measure(text)), min_width)
             text_height = float(label_font.metrics("linespace"))
             label_padding = 3.0 if background is not None else 0.0
             best_candidate = candidates[0]
@@ -2357,6 +2488,17 @@ class HotspotBenchmarkApp:
             for offset_x, offset_y, anchor in candidates:
                 label_x = x + offset_x
                 label_y = y + offset_y
+                if keep_inside:
+                    if anchor in ("e", "ne", "se"):
+                        label_x = max(label_x, 2.0 + text_width)
+                    elif anchor in ("w", "nw", "sw"):
+                        label_x = min(label_x, width - 2.0 - text_width)
+                    if anchor in ("ne", "nw"):
+                        label_y = max(label_y, 2.0 + text_height)
+                    elif anchor in ("se", "sw"):
+                        label_y = min(label_y, height - 2.0)
+                    else:
+                        label_y = min(max(label_y, 2.0 + text_height / 2.0), height - 2.0 - text_height / 2.0)
                 if anchor in ("e", "ne", "se"):
                     box_left = label_x - text_width
                 elif anchor in ("center", "n", "s"):
@@ -2404,6 +2546,17 @@ class HotspotBenchmarkApp:
             offset_x, offset_y, anchor = best_candidate
             label_x = x + offset_x
             label_y = y + offset_y
+            if keep_inside:
+                if anchor in ("e", "ne", "se"):
+                    label_x = max(label_x, 2.0 + text_width)
+                elif anchor in ("w", "nw", "sw"):
+                    label_x = min(label_x, width - 2.0 - text_width)
+                if anchor in ("ne", "nw"):
+                    label_y = max(label_y, 2.0 + text_height)
+                elif anchor in ("se", "sw"):
+                    label_y = min(label_y, height - 2.0)
+                else:
+                    label_y = min(max(label_y, 2.0 + text_height / 2.0), height - 2.0 - text_height / 2.0)
             if anchor in ("e", "ne", "se"):
                 box_left = label_x - text_width
             elif anchor in ("center", "n", "s"):
@@ -2465,34 +2618,82 @@ class HotspotBenchmarkApp:
                     crop_canvas_x, crop_canvas_y = map_point((crop_left, crop_top))
                     crop_image_item = canvas.create_image(crop_canvas_x, crop_canvas_y, image=crop_photo, anchor="nw")
                     canvas.tag_lower(crop_image_item)
-            canvas.create_polygon(*polygon_points, outline=C["cover_gt"], fill="", width=2)
+            overlay_width = max(1, canvas.winfo_width())
+            overlay_height = max(1, canvas.winfo_height())
+            overlay_figure = Figure(
+                figsize=(overlay_width / 100.0, overlay_height / 100.0),
+                dpi=100,
+                frameon=False,
+            )
+            overlay_axes = overlay_figure.add_axes((0, 0, 1, 1))
+            overlay_axes.set_xlim(0, overlay_width)
+            overlay_axes.set_ylim(overlay_height, 0)
+            overlay_axes.axis("off")
+            overlay_axes.add_patch(Polygon(
+                cover_points, closed=True, fill=False,
+                edgecolor=C["muted"], linewidth=2.0,
+                linestyle="-", antialiased=True,
+            ))
+            overlay_canvas = FigureCanvasAgg(overlay_figure)
+            overlay_canvas.draw()
+            cover_overlay = Image.frombytes(
+                "RGBA", (overlay_width, overlay_height),
+                overlay_canvas.buffer_rgba(),
+            )
+            canvas._hotspot_cover_overlay = ImageTk.PhotoImage(cover_overlay)  # type: ignore[attr-defined]
+            canvas.create_image(0, 0, image=canvas._hotspot_cover_overlay, anchor="nw")  # type: ignore[attr-defined]
             hotspot_polygon = cover_points
             for corner_name in ("TL", "TR", "BL", "BR"):
                 if not self.overlay_vars["show_corner_points"].get():
                     continue
                 x, y = map_point(ordered_cover_points[corner_name])
                 gt_x, gt_y = ordered_cover_points[corner_name]
-                corner_candidates = {
-                    "TL": ((-9, -9, "se"), (9, -9, "sw"), (-9, 9, "ne")),
-                    "TR": ((9, -9, "sw"), (-9, -9, "se"), (9, 9, "nw")),
-                    "BL": ((-9, 9, "ne"), (-9, -9, "se"), (9, 9, "nw")),
-                    "BR": ((9, 9, "nw"), (9, -9, "sw"), (-9, 9, "ne")),
-                }[corner_name]
-                place_label(
-                    x, y, f"{corner_name} ({gt_x:.0f},{gt_y:.0f})", C["cover_gt"], corner_candidates,
+                label_parent = left_corner_labels if corner_name in ("TL", "BL") else right_corner_labels
+                label_anchor = tk.W if corner_name in ("TL", "BL") else tk.E
+                label = tk.Label(
+                    label_parent,
+                    text=f"{corner_name} ({gt_x:.0f},{gt_y:.0f})",
+                    bg=C["thermal_surface"],
+                    fg=C["muted"],
+                    font=label_font,
+                    anchor=label_anchor,
+                )
+                label.place(
+                    relx=1.0 if label_anchor == tk.W else 0.0,
+                    x=-1 if label_anchor == tk.W else -1,
+                    y=y,
+                    anchor="e" if label_anchor == tk.W else "w",
                 )
 
         for index, point in enumerate(self.current_gt_hotspots, start=1):
             x, y = map_point(point)
-            canvas.create_line(x - 7, y, x + 7, y, fill=C["cover_gt"], width=2)
-            canvas.create_line(x, y - 7, x, y + 7, fill=C["cover_gt"], width=2)
+            marker_tag = f"gt_marker_{index}"
+            marker_ids = [
+                canvas.create_line(x - 8, y, x + 8, y, fill="#000000", width=4, tags=(marker_tag,)),
+                canvas.create_line(x, y - 8, x, y + 8, fill="#000000", width=4, tags=(marker_tag,)),
+                canvas.create_line(x - 7, y, x + 7, y, fill=C["muted"], width=2, tags=(marker_tag,)),
+                canvas.create_line(x, y - 7, x, y + 7, fill=C["muted"], width=2, tags=(marker_tag,)),
+            ]
+            bind_marker_hover(marker_ids, f"Hotspot #{index} (GT)", x, y)
 
         for index, prediction in enumerate(predictions, start=1):
             predicted_point = prediction["coordinate"]
             x, y = map_point(predicted_point)
-            canvas.create_rectangle(x - 6, y - 6, x + 6, y + 6, outline=C["cover_predicted"], width=2)
+            predicted_marker = canvas.create_rectangle(
+                x - 7, y - 7, x + 7, y + 7,
+                outline="#60A5FA", width=2,
+                fill="", tags=(f"predicted_marker_{index}",),
+            )
+            bind_marker_hover([predicted_marker], f"Hotspot #{index} (Predicted)", x, y)
             matched_gt = map_point(prediction["ground_truth"])
-            canvas.create_line(matched_gt[0], matched_gt[1], x, y, fill="#FFD54F", width=1, dash=(3, 2))
+            canvas.create_line(
+                matched_gt[0], matched_gt[1], x, y,
+                fill="#123B4A", width=2, dash=(3, 2),
+            )
+            canvas.create_line(
+                matched_gt[0], matched_gt[1], x, y,
+                fill="#FFD54F", width=2, dash=(3, 2),
+            )
 
     @staticmethod
     def _calculate_hotspot_metrics(
@@ -2534,14 +2735,13 @@ class HotspotBenchmarkApp:
             hit_results.append(f"#{len(hit_results) + 1}: {result_text}")
 
         distance_text = " / ".join(f"{distance:.1f} px" for distance in distances)
-        normalized_distance_text = " / ".join(f"{distance * 100.0:.2f}%" for distance in normalized_distances)
+        normalized_distance_text = " / ".join(
+            f"{distance * 100.0:.2f}% ({'<1%' if distance < 0.01 else '1~1.5%' if distance < 0.015 else '>=1.5%'})"
+            for distance in normalized_distances
+        )
         return [
             ("Distance (px)", distance_text),
             ("Normalized Dist (%)", normalized_distance_text),
-            ("Match Quality", " / ".join(
-                f"{max(0.0, 100.0 - distance * 100.0):.2f}%"
-                for distance in normalized_distances
-            )),
             ("Result", "\n".join(hit_results)),
         ]
 
@@ -2563,10 +2763,10 @@ class HotspotBenchmarkApp:
         self._populate_detection_status()
 
     def _build_hotspot_zoom_control(self, parent: tk.Frame) -> None:
-        """Build the hotspot zoom control fixed to the canvas bottom-right corner."""
+        """Build the hotspot zoom control fixed to the canvas right-center edge."""
         panel_bg = "#182033"
         control_area = tk.Frame(parent, bg=C["thermal_surface"])
-        control_area.place(relx=1.0, rely=1.0, anchor="se", x=-8, y=-6)
+        control_area.place(relx=1.0, rely=0.5, anchor="e", x=-8)
 
         def make_button(surface: tk.Canvas, text: str, command, tooltip: str) -> None:
             button = tk.Label(
@@ -2658,51 +2858,70 @@ class HotspotBenchmarkApp:
             grid.columnconfigure(col_index, weight=1, uniform="model_card")
 
         summary = self.dataset_summary
-        has_summary = bool(summary) and all(summary.get(k, {}).get("avg_error") is not None for k in MODEL_KEYS)
-        badge_keys: dict[str, set[str]] = {}
-        if has_summary:
-            # Use sets (not a single "best" key) so ties are all awarded the badge instead of
-            # picking an arbitrary winner when two models score identically.
-            best_error = min(summary[k]["avg_error"] for k in MODEL_KEYS)
-            best_inference_time = min(summary[k]["avg_inference_time_ms"] for k in MODEL_KEYS)
-            best_score = max(summary[k]["overall_score"] for k in MODEL_KEYS)
-            badge_keys = {
-                "accuracy": {k for k in MODEL_KEYS if summary[k]["avg_error"] == best_error},
-                "speed": {k for k in MODEL_KEYS if summary[k]["avg_inference_time_ms"] == best_inference_time},
-                "overall": {k for k in MODEL_KEYS if summary[k]["overall_score"] == best_score},
-            }
-
         self._build_hotspot_summary_card(grid, summary.get("hotspot"))
         for col_index, model_key in enumerate(MODEL_KEYS, start=1):
-            self._build_model_summary_card(grid, col_index, model_key, summary.get(model_key), badge_keys)
+            self._build_model_summary_card(grid, col_index, model_key, summary.get(model_key))
 
     def _build_hotspot_summary_card(self, parent: tk.Frame, stats: Optional[dict]) -> None:
         """Build the first Execution Summary column for OpenCV hotspot results."""
         card = tk.Frame(parent, bg=C["thermal_surface"], highlightbackground=C["border"], highlightthickness=1)
         card.grid(row=0, column=0, sticky="new", padx=(0, 8))
         inner = tk.Frame(card, bg=C["thermal_surface"])
-        inner.pack(fill=tk.X, padx=5, pady=3)
+        inner.pack(fill=tk.X, padx=6, pady=(5, 3))
         tk.Label(inner, text="Hotspot Detection (OpenCV)", bg=C["thermal_surface"], fg=C["text"],
                  font=(FF, 11, "bold")).pack(anchor=tk.W)
         if not stats or stats.get("avg_distance") is None:
             tk.Label(inner, text="Run all images to view metrics.", bg=C["thermal_surface"],
-                     fg=C["muted"], font=(FF, 9)).pack(anchor=tk.W, pady=(5, 3))
+                     fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W, pady=(5, 3))
             return
-        metric_values = (
-            ("Avg Distance", f'{stats["avg_distance"]:.2f} px'),
-            ("Avg Normalized Dist", f'{stats["avg_normalized_distance_percent"]:.3f}%'),
-            ("Perfect Hit", str(stats["result_counts"]["Perfect Hit"])),
-            ("Acceptable Hit", str(stats["result_counts"]["Acceptable Hit"])),
-            ("Miss", str(stats["result_counts"]["Miss"])),
+
+        def build_section(title: str, metrics: tuple[tuple[str, str, str, int], ...]) -> None:
+            section = tk.Frame(inner, bg=C["thermal_surface"], highlightbackground=C["border"], highlightthickness=1)
+            section.pack(fill=tk.X, pady=(4 if title == "Detection Quality" else 14, 0))
+            tk.Label(section, text=title, bg=C["thermal_surface"], fg=C["muted"],
+                     font=(FF, 9, "bold"), anchor="w").pack(fill=tk.X, padx=7, pady=(5, 3))
+            tk.Frame(section, bg=C["border"], height=1).pack(fill=tk.X)
+            rows = tk.Frame(section, bg=C["thermal_surface"])
+            rows.pack(fill=tk.X, padx=7, pady=(3, 5))
+            for column_index, (label, value, color, value_size) in enumerate(metrics):
+                metric_card = tk.Frame(
+                    rows, bg=C["thermal_surface"],
+                    highlightbackground=color, highlightthickness=1,
+                )
+                metric_card.grid(row=0, column=column_index, sticky="nsew", padx=(0 if column_index == 0 else 4, 0))
+                rows.columnconfigure(column_index, weight=1, uniform="quality_card")
+                tk.Label(metric_card, text=value, bg=C["thermal_surface"], fg=color,
+                         font=(FF, value_size, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
+                tk.Label(metric_card, text=label, bg=C["thermal_surface"], fg=C["muted"],
+                         font=(FF, 8), anchor="center").pack(fill=tk.X, padx=3, pady=(0, 5))
+
+        success_rate = float(stats["success_rate"])
+        success_color = C["success"] if success_rate >= 80.0 else C["warning"] if success_rate >= 50.0 else C["error"]
+        build_section("Detection Quality", (
+            ("Success Rate", f'{success_rate:.1f}%', success_color, 20),
+            ("Median Error", f'{stats["median_error_percent"]:.1f}%', "#007FFF", 20),
+            ("Worst Error", f'{stats["worst_error_percent"]:.1f}%', "#FF6F00", 20),
+        ))
+
+        result_counts = stats["result_counts"]
+        total_hits = sum(result_counts.values())
+        distribution_metrics = (
+            ("Perfect Hit", result_counts["Perfect Hit"], C["success"]),
+            ("Acceptable Hit", result_counts["Acceptable Hit"], C["warning"]),
+            ("Miss", result_counts["Miss"], C["error"]),
         )
-        for label, value in metric_values:
-            row = tk.Frame(inner, bg=C["thermal_surface"])
-            row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=f"{label}: ", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 9)).pack(side=tk.LEFT)
-            tk.Label(row, text=value, bg=C["thermal_surface"], fg=C["accent"], font=(FF, 9, "bold")).pack(side=tk.LEFT)
+        build_section("Hit Distribution", tuple(
+            (
+                label,
+                f'{count} ({100.0 * count / total_hits:.0f}%)' if total_hits else "0 (0%)",
+                color,
+                14,
+            )
+            for label, count, color in distribution_metrics
+        ))
 
     def _build_model_summary_card(self, parent: tk.Frame, column: int, model_key: str,
-                                   stats: Optional[dict], badge_keys: dict[str, set[str]]) -> None:
+                                   stats: Optional[dict]) -> None:
         card = tk.Frame(parent, bg=C["thermal_surface"], highlightbackground=C["border"], highlightthickness=1)
         card.grid(row=0, column=column, sticky="new", padx=(0 if column == 0 else 8, 0))
         self.model_cards[model_key] = card
@@ -2712,42 +2931,34 @@ class HotspotBenchmarkApp:
 
         title_row = tk.Frame(inner, bg=C["thermal_surface"])
         title_row.pack(fill=tk.X)
-        tk.Label(title_row, text=SHORT_MODEL_NAMES[model_key], bg=C["thermal_surface"], fg=C["text"], font=(FF, 11, "bold")).pack(side=tk.LEFT)
-        badge_holder = tk.Frame(title_row, bg=C["thermal_surface"])
-        badge_holder.pack(side=tk.RIGHT)
-
+        summary_model_name = SHORT_MODEL_NAMES[model_key]
+        tk.Label(title_row, text=f"C-Cover Detection ({summary_model_name})", bg=C["thermal_surface"], fg=C["text"], font=(FF, 11, "bold")).pack(side=tk.LEFT)
         metrics_frame = tk.Frame(inner, bg=C["thermal_surface"])
-        metrics_frame.pack(fill=tk.X, pady=(4, 4))
-        metrics_frame.columnconfigure(0, weight=1, uniform="summary_metric")
-        metrics_frame.columnconfigure(1, weight=0)
-        metrics_frame.columnconfigure(2, weight=1, uniform="summary_metric")
+        metrics_frame.pack(fill=tk.X, pady=(35, 4))
         if stats is None:
-            tk.Label(metrics_frame, text="Run all models to view metrics.", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W)
+            tk.Label(metrics_frame, text="Run all images to view metrics.", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W)
         else:
-            metric_cells = (
-                ("Overall Score", f'{stats["overall_score"]}', C["accent"] if model_key in badge_keys.get("overall", set()) else C["muted"], 0, 0),
-                ("Success Rate", f'{stats["avg_success_rate"]}%', C["muted"], 0, 2),
-                ("Avg Error", f'{stats["avg_error"]} px', C["cover_gt"] if model_key in badge_keys.get("accuracy", set()) else C["muted"], 1, 0),
-                ("Avg IoU", f'{stats["avg_iou"]}', C["muted"], 1, 2),
-                ("Avg FPS", f'{stats["avg_fps"]}', C["success"] if model_key in badge_keys.get("speed", set()) else C["muted"], 2, 0),
-                ("mAP@3px", f'{stats["map_at_3px"]}%', C["muted"], 2, 2),
+            metric_cards = (
+                ("Avg Accuracy (IoU)", f'{stats["avg_iou"] * 100.0:.1f}%', C["cover_predicted"]),
+                ("Avg Error", f'{stats["avg_cover_error_percent"]:.1f}%', C["error"]),
+                ("Avg Latency", f'{stats["avg_inference_time_ms"]:.1f} ms', C["muted"]),
+                ("Avg FPS", f'{stats["avg_fps"]:.1f}', C["success"]),
             )
-            tk.Frame(metrics_frame, bg=C["border"], width=1).grid(row=0, column=1, rowspan=3, sticky="ns", padx=6)
-            for label, value, color, row, column in metric_cells:
-                cell = tk.Frame(metrics_frame, bg=C["thermal_surface"])
-                cell.grid(row=row, column=column, sticky="w", pady=3)
-                tk.Label(cell, text="•", bg=C["thermal_surface"], fg=color, font=(FF, 10, "bold")).pack(side=tk.LEFT, padx=(0, 3))
-                tk.Label(cell, text=f"{label}: ", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(side=tk.LEFT)
-                tk.Label(cell, text=value, bg=C["thermal_surface"], fg=color, font=(FF, 10, "bold")).pack(side=tk.LEFT)
-
-        if model_key in badge_keys.get("overall", set()):
-            self._make_summary_badge(badge_holder, "👑 Best Overall", C["accent"])
-        if model_key in badge_keys.get("accuracy", set()):
-            # Use a distinct color from "Fastest Model" so the two badges stay visually separable
-            self._make_summary_badge(badge_holder, "🏆 Best Accuracy", C["cover_gt"])
-        if model_key in badge_keys.get("speed", set()):
-            # Keep the same color as the per-image "Fastest" badge for visual consistency
-            self._make_summary_badge(badge_holder, "⚡ Fastest Model", C["success"])
+            for column_index in range(2):
+                metrics_frame.columnconfigure(column_index, weight=1, uniform="cover_summary_metric")
+            for index, (label, value, color) in enumerate(metric_cards):
+                metric_card = tk.Frame(
+                    metrics_frame, bg=C["thermal_surface"],
+                    highlightbackground=color, highlightthickness=1,
+                )
+                metric_card.grid(
+                    row=index // 2, column=index % 2, sticky="nsew",
+                    padx=(0 if index % 2 == 0 else 4, 0), pady=(0 if index < 2 else 48, 0),
+                )
+                tk.Label(metric_card, text=value, bg=C["thermal_surface"], fg=color,
+                         font=(FF, 20, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
+                tk.Label(metric_card, text=label, bg=C["thermal_surface"], fg=C["muted"],
+                         font=(FF, 8), anchor="center").pack(fill=tk.X, padx=3, pady=(0, 5))
 
         self._bind_card_hover(card)
 

@@ -1,0 +1,5 @@
+path: C:/Users/michaelh/applications.automation.autolab.physicalAIsimulation/datasets/c_cover_obb
+train: images/train
+val: images/val
+names:
+  0: c_cover

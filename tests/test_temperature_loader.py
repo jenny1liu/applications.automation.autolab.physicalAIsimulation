@@ -21,8 +21,8 @@ class TestTemperatureLoader(unittest.TestCase):
         ))
 
         self.assertEqual(metrics["Distance (px)"], "1.0 px / 2.0 px")
-        self.assertEqual(metrics["Normalized Dist (%)"], "1.00% / 2.00%")
-        self.assertEqual(metrics["Match Quality"], "99.00% / 98.00%")
+        self.assertEqual(metrics["Normalized Dist (%)"], "1.00% (1~1.5%) / 2.00% (>=1.5%)")
+        self.assertNotIn("Match Quality", metrics)
         self.assertEqual(metrics["Result"], "#1: Acceptable Hit\n#2: Miss")
 
         perfect_metrics = dict(HotspotBenchmarkApp._calculate_hotspot_metrics(
