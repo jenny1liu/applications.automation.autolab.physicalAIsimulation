@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -16,6 +16,7 @@ class YOLODetectionResult:
     confidence: float
     inference_time_ms: float
     max_temperature: float
+    detections: list[dict] = field(default_factory=list)
 
 
 class YOLOv8PyTorchDetector:
@@ -58,10 +59,12 @@ class YOLOv8PyTorchDetector:
             f"(precision: {precisionText}, model: {self.model_name})"
         )
 
-    def detect(self, thermal_image: np.ndarray) -> YOLODetectionResult:
+    def detect(self, thermal_image: np.ndarray, temperature_image: np.ndarray | None = None) -> YOLODetectionResult:
         """Run YOLOv8 detection on thermal image."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if temperature_image is not None and temperature_image.shape != thermal_image.shape:
+            raise ValueError("temperature_image must have the same shape as thermal_image")
 
         t0 = time.perf_counter()
 
@@ -80,8 +83,9 @@ class YOLOv8PyTorchDetector:
 
         inference_time_ms = (time.perf_counter() - t0) * 1000.0
 
-        max_temp = float(np.max(thermal_image))
+        max_temp = float(np.max(temperature_image)) if temperature_image is not None else float(np.max(thermal_image))
 
+        detections: list[dict] = []
         if not results or len(results[0].boxes) == 0:
             center_y, center_x = np.unravel_index(np.argmax(thermal_image), thermal_image.shape)
             center_x = float(center_x)
@@ -92,6 +96,7 @@ class YOLOv8PyTorchDetector:
             y = int(np.clip(center_y - box_h / 2, 0, max(0, thermal_image.shape[0] - box_h)))
             bbox = (x, y, box_w, box_h)
             confidence = 0.05
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
         else:
             boxes = results[0].boxes
             confs = boxes.conf.cpu().numpy()
@@ -115,7 +120,8 @@ class YOLOv8PyTorchDetector:
                 score = float(confs[idx]) * (0.65 + 0.35 * thermal_score)
                 scores.append(score)
 
-            best_idx = int(np.argmax(np.asarray(scores, dtype=np.float32)))
+            ranked_indices = np.argsort(np.asarray(scores, dtype=np.float32))[::-1][:2]
+            best_idx = int(ranked_indices[0])
             x1, y1, x2, y2 = xyxy[best_idx]
             x1i = int(np.clip(np.floor(x1), 0, thermal_image.shape[1] - 1))
             y1i = int(np.clip(np.floor(y1), 0, thermal_image.shape[0] - 1))
@@ -125,6 +131,22 @@ class YOLOv8PyTorchDetector:
             center_x, center_y = self._thermal_weighted_center(thermal_image, x1i, y1i, x2i, y2i)
             bbox = (x1i, y1i, max(1, x2i - x1i), max(1, y2i - y1i))
             confidence = float(confs[best_idx])
+            detections.append({"center_x": center_x, "center_y": center_y, "bbox": bbox, "confidence": confidence})
+            for candidate_idx in ranked_indices[1:]:
+                candidate_x1, candidate_y1, candidate_x2, candidate_y2 = xyxy[int(candidate_idx)]
+                candidate_x1i = int(np.clip(np.floor(candidate_x1), 0, thermal_image.shape[1] - 1))
+                candidate_y1i = int(np.clip(np.floor(candidate_y1), 0, thermal_image.shape[0] - 1))
+                candidate_x2i = int(np.clip(np.ceil(candidate_x2), candidate_x1i + 1, thermal_image.shape[1]))
+                candidate_y2i = int(np.clip(np.ceil(candidate_y2), candidate_y1i + 1, thermal_image.shape[0]))
+                candidate_center_x, candidate_center_y = self._thermal_weighted_center(
+                    thermal_image, candidate_x1i, candidate_y1i, candidate_x2i, candidate_y2i
+                )
+                detections.append({
+                    "center_x": candidate_center_x,
+                    "center_y": candidate_center_y,
+                    "bbox": (candidate_x1i, candidate_y1i, candidate_x2i - candidate_x1i, candidate_y2i - candidate_y1i),
+                    "confidence": float(confs[int(candidate_idx)]),
+                })
 
         return YOLODetectionResult(
             center_x=center_x,
@@ -133,6 +155,7 @@ class YOLOv8PyTorchDetector:
             confidence=confidence,
             inference_time_ms=inference_time_ms,
             max_temperature=max_temp,
+            detections=detections,
         )
 
     def _prepare_thermal_input(self, thermal_image: np.ndarray) -> np.ndarray:
