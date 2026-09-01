@@ -5,6 +5,7 @@ to match the visual language used in thermal/ui.py (dark engineering theme).
 
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox
@@ -53,8 +54,25 @@ SHORT_MODEL_NAMES = {"opencv": "OpenCV", "pytorch": "PyTorch", "openvino": "Open
 CONFIDENCE_PASS_THRESHOLD = 85
 IOU_PASS_THRESHOLD = 0.7
 HOTSPOT_SUCCESS_DISTANCE_PX = 3.0
-PYTORCH_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "c_cover_obb" / "weights" / "best.pt"
-OPENVINO_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "c_cover_obb" / "weights" / "best_openvino_model"
+
+
+def resolve_runtime_model_path(*relative_parts: str) -> Path:
+    """Resolve bundled model files correctly in both source and PyInstaller EXE runs."""
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        bundled_root = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "_MEIPASS", None) else Path(sys.executable).resolve().parent
+        candidates.append(bundled_root.joinpath(*relative_parts))
+        candidates.append(Path(sys.executable).resolve().parent.joinpath(*relative_parts))
+    candidates.append(Path(__file__).resolve().parent.parent.joinpath(*relative_parts))
+    candidates.append(Path.cwd().joinpath(*relative_parts))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else Path(*relative_parts)
+
+
+PYTORCH_MODEL_PATH = resolve_runtime_model_path("runs", "c_cover_obb", "weights", "best.pt")
+OPENVINO_MODEL_PATH = resolve_runtime_model_path("runs", "c_cover_obb", "weights", "best_openvino_model")
 
 
 class DarkScrollbar(tk.Canvas):

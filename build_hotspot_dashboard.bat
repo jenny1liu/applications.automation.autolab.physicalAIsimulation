@@ -40,6 +40,8 @@ python -m PyInstaller --noconfirm %MODE% --name HotspotDashboard --paths . ^
     --add-data "thermal\yolov8n.pt;thermal" ^
     --add-data "thermal\yolov8n_openvino_model;thermal\yolov8n_openvino_model" ^
     --add-data "hotspot_detector\pseudo_ground_truth;hotspot_detector\pseudo_ground_truth" ^
+    --add-data "runs\c_cover_obb\weights\best.pt;runs\c_cover_obb\weights" ^
+    --add-data "runs\c_cover_obb\weights\best_openvino_model;runs\c_cover_obb\weights\best_openvino_model" ^
     hotspot_dashboard_entry.py
 
 if errorlevel 1 (
