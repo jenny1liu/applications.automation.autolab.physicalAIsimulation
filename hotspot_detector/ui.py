@@ -637,9 +637,40 @@ class HotspotBenchmarkApp:
 
     def _on_openvino_runtime_change(self, _selected: str) -> None:
         device = self.openvinoDeviceVar.get().strip().upper()
+        try:
+            if device != "AUTO":
+                from openvino import Core
+                availableDevices = {availableDevice.split(".", 1)[0].upper() for availableDevice in Core().available_devices}
+                if device not in availableDevices:
+                    self.openvinoDeviceVar.set("CPU")
+                    self._refresh_openvino_precision_options()
+                    self._openvino_detector = None
+                    self._set_status(f"OpenVINO {device} is unavailable; reverted to CPU", C["warning"])
+                    return
+        except Exception as error:
+            self.openvinoDeviceVar.set("CPU")
+            self._refresh_openvino_precision_options()
+            self._openvino_detector = None
+            self._set_status("OpenVINO device check failed; reverted to CPU", C["error"])
+            print(f"[ui] OpenVINO device availability check failed: {error}")
+            return
         self._refresh_openvino_precision_options()
         self._openvino_detector = None
         self._set_status("OpenVINO runtime updated (reload on next run)", C["warning"])
+
+    @staticmethod
+    def _get_openvino_backend_device(device: str) -> str:
+        normalizedDevice = device.strip().upper()
+        backendDevices = {
+            "CPU": "cpu",
+            "GPU": "intel:gpu",
+            "NPU": "intel:npu",
+            "AUTO": "intel:auto",
+        }
+        try:
+            return backendDevices[normalizedDevice]
+        except KeyError as error:
+            raise ValueError(f"Unsupported OpenVINO device: {device}") from error
 
     def _get_openvino_precision_options(self, device: str) -> tuple[str, ...]:
         device = device.strip().upper()
@@ -1418,7 +1449,7 @@ class HotspotBenchmarkApp:
                 raise FileNotFoundError(f"OpenVINO model not found: {OPENVINO_MODEL_PATH}")
             self._openvino_detector = CCoverOBBDetector(
                 model_path=str(OPENVINO_MODEL_PATH),
-                device=self.openvinoDeviceVar.get(),
+                device=self._get_openvino_backend_device(self.openvinoDeviceVar.get()),
                 conf_threshold=0.5,
             )
         return self._openvino_detector
@@ -3107,8 +3138,9 @@ class HotspotBenchmarkApp:
 
         grid = tk.Frame(frame, bg=C["thermal_surface"])
         grid.pack(fill=tk.X, anchor=tk.N)
-        for col_index in range(len(MODEL_KEYS) + 1):
-            grid.columnconfigure(col_index, weight=1, uniform="model_card")
+        grid.columnconfigure(0, weight=115)
+        for col_index in range(1, len(MODEL_KEYS) + 1):
+            grid.columnconfigure(col_index, weight=100)
 
         summary = self.dataset_summary
         self._build_hotspot_summary_card(grid, summary.get("hotspot"))
@@ -3118,7 +3150,7 @@ class HotspotBenchmarkApp:
     def _build_hotspot_summary_card(self, parent: tk.Frame, stats: Optional[dict]) -> None:
         """Build the first Execution Summary column for OpenCV hotspot results."""
         card = tk.Frame(parent, bg=C["thermal_surface"], highlightbackground=C["border"], highlightthickness=1)
-        card.grid(row=0, column=0, sticky="new", padx=(0, 8))
+        card.grid(row=0, column=0, sticky="new")
         inner = tk.Frame(card, bg=C["thermal_surface"])
         inner.pack(fill=tk.X, padx=6, pady=(5, 3))
         tk.Label(inner, text="Hotspot Detection (OpenCV)", bg=C["thermal_surface"], fg=C["text"],
@@ -3144,9 +3176,9 @@ class HotspotBenchmarkApp:
                 metric_card.grid(row=0, column=column_index, sticky="nsew", padx=(0 if column_index == 0 else 4, 0))
                 rows.columnconfigure(column_index, weight=1, uniform="quality_card")
                 tk.Label(metric_card, text=value, bg=C["thermal_surface"], fg=color,
-                         font=(FF, value_size, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
+                         font=(FF, value_size - 3, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
                 tk.Label(metric_card, text=label, bg=C["thermal_surface"], fg=C["muted"],
-                         font=(FF, 8), anchor="center").pack(fill=tk.X, padx=3, pady=(0, 5))
+                         font=(FF, 8), anchor="center", justify=tk.CENTER, wraplength=88).pack(fill=tk.X, padx=3, pady=(0, 5))
 
         success_rate = float(stats["success_rate"])
         success_color = C["success"] if success_rate >= 80.0 else C["warning"] if success_rate >= 50.0 else C["error"]
@@ -3185,9 +3217,13 @@ class HotspotBenchmarkApp:
         title_row = tk.Frame(inner, bg=C["thermal_surface"])
         title_row.pack(fill=tk.X)
         summary_model_name = SHORT_MODEL_NAMES[model_key]
-        tk.Label(title_row, text=f"C-Cover Detection ({summary_model_name})", bg=C["thermal_surface"], fg=C["text"], font=(FF, 11, "bold")).pack(side=tk.LEFT)
+        tk.Label(
+            title_row, text=f"C-Cover Detection\n({summary_model_name})",
+            bg=C["thermal_surface"], fg=C["text"], font=(FF, 11, "bold"),
+            justify=tk.LEFT, anchor="w",
+        ).pack(side=tk.LEFT)
         metrics_frame = tk.Frame(inner, bg=C["thermal_surface"])
-        metrics_frame.pack(fill=tk.X, pady=(35, 4))
+        metrics_frame.pack(fill=tk.X, pady=(17, 4))
         if stats is None:
             tk.Label(metrics_frame, text="Run all images to view metrics.", bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(anchor=tk.W)
         else:
@@ -3209,7 +3245,7 @@ class HotspotBenchmarkApp:
                     padx=(0 if index % 2 == 0 else 4, 0), pady=(0 if index < 2 else 48, 0),
                 )
                 tk.Label(metric_card, text=value, bg=C["thermal_surface"], fg=color,
-                         font=(FF, 20, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
+                         font=(FF, 18, "bold"), anchor="center").pack(fill=tk.X, padx=3, pady=(5, 0))
                 tk.Label(metric_card, text=label, bg=C["thermal_surface"], fg=C["muted"],
                          font=(FF, 8), anchor="center").pack(fill=tk.X, padx=3, pady=(0, 5))
 
