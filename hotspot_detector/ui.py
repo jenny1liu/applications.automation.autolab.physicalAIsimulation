@@ -6,6 +6,7 @@ to match the visual language used in thermal/ui.py (dark engineering theme).
 from __future__ import annotations
 
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox
@@ -257,7 +258,9 @@ class HotspotBenchmarkApp:
         self.run_counter = 0
 
         self.status_var = tk.StringVar(value="Ready")
+        self.totalExecTimeVar = tk.StringVar(value="")
         self.image_index_var = tk.StringVar(value="0 / 0")
+        self.hotspotExecTimeVar = tk.StringVar(value="")
         self.pytorchDeviceVar = tk.StringVar(value="CPU")
         self.pytorchPrecisionVar = tk.StringVar(value="FP32")
         self.openvinoDeviceVar = tk.StringVar(value="CPU")
@@ -273,6 +276,7 @@ class HotspotBenchmarkApp:
         self.canvases: dict[str, FigureCanvasTkAgg] = {}
         self.metrics_frames: dict[str, tk.Frame] = {}
         self.badge_labels: dict[str, tk.Label] = {}
+        self.modelExecTimeVars: dict[str, tk.StringVar] = {}
         self.model_description_vars: dict[str, tk.StringVar] = {}
         self.detection_status_frame: Optional[tk.Frame] = None
         self.model_summary_frame: Optional[tk.Frame] = None
@@ -320,6 +324,19 @@ class HotspotBenchmarkApp:
         self._status_display_text = "Ready"
         self._benchmark_running = False
         self._openvino_warmup_started = False
+        self._runStartedAt: Optional[float] = None
+        self.executionTimes = {
+            "hotspot": 0.0,
+            "opencv": 0.0,
+            "pytorch": 0.0,
+            "openvino": 0.0,
+        }
+        self.timingDetails = {
+            "total": 0.0,
+            "dataLoading": 0.0,
+            "summaryCalculation": 0.0,
+            "uiRendering": 0.0,
+        }
 
         self._build_header()
         self._build_body()
@@ -403,12 +420,12 @@ class HotspotBenchmarkApp:
             )
 
         right_controls = tk.Frame(header, bg=C["header"])
-        right_controls.pack(side=tk.RIGHT, padx=(0, 16), pady=10)
+        right_controls.pack(side=tk.RIGHT, padx=(0, 22), pady=10)
 
         toolbar_font = tkfont.Font(family=FF, size=9, weight="bold")
         check_results_font = tkfont.Font(family=FF, size=8, weight="bold")
         check_segment_width = check_results_font.measure("Check Results") + check_results_font.measure("20 / 20") + 58
-        status_segment_width = toolbar_font.measure("Status OpenVINO runtime updated (reload on next run)") + 16
+        status_segment_width = toolbar_font.measure("Status OpenVINO runtime updated (reload on next run)") + 85
         runtime_segment_width = 430
         run_segment_width = 122
         divider_total_width = (1 + 2 + 8) * 3
@@ -501,6 +518,35 @@ class HotspotBenchmarkApp:
         )
         self._status_label.pack(side=tk.LEFT)
         self._status_badge.pack(side=tk.LEFT)
+        self._totalExecTimeButton = tk.Button(
+            info_bar,
+            textvariable=self.totalExecTimeVar,
+            command=lambda: self._show_execution_time_details(self._totalExecTimeButton),
+            bg="#111B2A",
+            fg=C["muted"],
+            activebackground="#1B2A40",
+            activeforeground=C["text"],
+            font=(FF, 8),
+            relief=tk.FLAT,
+            bd=0,
+            highlightbackground=C["border"],
+            highlightthickness=1,
+            padx=5,
+            pady=1,
+            cursor="hand2",
+        )
+        self._totalExecTimeButton.bind(
+            "<Enter>",
+            lambda _event: self._totalExecTimeButton.configure(
+                bg="#1B2A40", fg=C["text"], highlightbackground=C["cover_predicted"]
+            ),
+        )
+        self._totalExecTimeButton.bind(
+            "<Leave>",
+            lambda _event: self._totalExecTimeButton.configure(
+                bg="#111B2A", fg=C["muted"], highlightbackground=C["border"]
+            ),
+        )
 
         self._sync_check_results_height_to_status_badge()
 
@@ -1009,6 +1055,7 @@ class HotspotBenchmarkApp:
             column=0,
             padx=(0, 0),
             title="Hotspot Detection (OpenCV)",
+            titleTrailingVar=self.hotspotExecTimeVar,
             titleRightBuilder=self._build_corner_points_control,
             bg=C["thermal_surface"],
             bordered=True,
@@ -1030,6 +1077,7 @@ class HotspotBenchmarkApp:
         column: int,
         padx: tuple[int, int],
         title: str,
+        titleTrailingVar: Optional[tk.StringVar] = None,
         titleRightBuilder: Optional[Callable[[tk.Frame], None]] = None,
         bg: str = C["card"],
         bordered: bool = True,
@@ -1047,7 +1095,16 @@ class HotspotBenchmarkApp:
         inner.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 3))
         title_row = tk.Frame(inner, bg=bg)
         title_row.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(title_row, text=title, bg=bg, fg=C["text"], font=(FF, 11, "bold")).pack(side=tk.LEFT, anchor=tk.N)
+        titleLabel = tk.Label(title_row, text=title, bg=bg, fg=C["text"], font=(FF, 11, "bold"))
+        titleLabel.pack(side=tk.LEFT, anchor=tk.N)
+        if titleTrailingVar is not None:
+            tk.Label(
+                title_row,
+                textvariable=titleTrailingVar,
+                bg=bg,
+                fg=C["muted"],
+                font=(FF, 8),
+            ).pack(side=tk.LEFT, anchor=tk.N, padx=(6, 0), pady=(2, 0))
         if titleRightBuilder is not None:
             titleRightBuilder(title_row)
         content = tk.Frame(inner, bg=bg)
@@ -1103,22 +1160,46 @@ class HotspotBenchmarkApp:
 
             content = tk.Frame(guide, bg=C["thermal_surface"], highlightbackground=C["border"], highlightthickness=1)
             content.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-            tk.Label(content, text="Summary Metrics", bg=C["thermal_surface"], fg=C["text"], font=(FF, 12, "bold")).pack(
+            tk.Label(content, text="Metric Guide", bg=C["thermal_surface"], fg=C["text"], font=(FF, 12, "bold")).pack(
                 anchor=tk.W, padx=10, pady=(8, 6)
             )
-            metric_items = (
-                ("Overall Score", "Success Rate - Avg Error x10 - Inference Time x0.5"),
-                ("Avg Error", "Mean hotspot pixel error"),
-                ("Avg FPS", "1000 / Average Inference Time (ms)"),
-                ("Success Rate", "Hotspots matched within 3px"),
-                ("Avg IoU", "Mean C-Cover intersection over union"),
-                ("mAP@3px", "Confidence-ranked average precision at 3px"),
+            metricSections = (
+                ("Hotspot Detection", (
+                    ("Success Rate", "Percentage of hotspots classified as Perfect or Acceptable hits"),
+                    ("Median Error", "Median hotspot distance divided by the image diagonal"),
+                    ("Worst Error", "Largest hotspot distance divided by the image diagonal"),
+                    ("Perfect Hit", "Distance below 1.0% of image diagonal; below 8px at 640 x 480"),
+                    ("Acceptable Hit", "Distance from 8px to below 12px at 640 x 480"),
+                    ("Miss", "Distance of 12px or more at 640 x 480, or no detection"),
+                    ("Pixel Threshold", "640 x 480 diagonal = 800px; 1.0% = 8px and 1.5% = 12px"),
+                )),
+                ("C-Cover Detection", (
+                    ("Accuracy (IoU)", "Intersection area divided by union area for predicted and ground-truth covers"),
+                    ("Error", "100% minus C-Cover IoU accuracy"),
+                    ("Latency", "Detector-reported inference time for the current image"),
+                    ("FPS", "1000 divided by inference latency in milliseconds"),
+                    ("Avg Accuracy / Error", "Mean C-Cover IoU accuracy and its complement across all images"),
+                    ("Avg Latency / FPS", "Mean detector latency and FPS across all images"),
+                )),
+                ("Execution Time", (
+                    ("Exec Time", "Model inference, function-call, and waiting time only; excludes data loading, summary calculation, drawing, and UI updates"),
+                    ("Total Exec Time", "End-to-end wall-clock time from clicking Run until Completed is rendered"),
+                    ("Processing Overhead", "Total Exec Time minus the four detector times; includes data loading, summary calculation, drawing, and UI updates"),
+                )),
             )
-            for label, description in metric_items:
-                row = tk.Frame(content, bg=C["thermal_surface"])
-                row.pack(fill=tk.X, padx=10, pady=3)
-                tk.Label(row, text=f"{label}: ", bg=C["thermal_surface"], fg=C["text"], font=(FF, 10, "bold")).pack(side=tk.LEFT)
-                tk.Label(row, text=description, bg=C["thermal_surface"], fg=C["muted"], font=(FF, 10)).pack(side=tk.LEFT)
+            for sectionTitle, metricItems in metricSections:
+                tk.Label(
+                    content,
+                    text=sectionTitle,
+                    bg=C["thermal_surface"],
+                    fg=C["cover_predicted"],
+                    font=(FF, 9, "bold"),
+                ).pack(anchor=tk.W, padx=10, pady=(7, 2))
+                for label, description in metricItems:
+                    row = tk.Frame(content, bg=C["thermal_surface"])
+                    row.pack(fill=tk.X, padx=10, pady=2)
+                    tk.Label(row, text=f"{label}: ", bg=C["thermal_surface"], fg=C["text"], font=(FF, 9, "bold")).pack(side=tk.LEFT)
+                    tk.Label(row, text=description, bg=C["thermal_surface"], fg=C["muted"], font=(FF, 9)).pack(side=tk.LEFT)
             tk.Button(
                 content,
                 text="Close",
@@ -1165,6 +1246,15 @@ class HotspotBenchmarkApp:
         title_row = tk.Frame(image_card, bg=C["thermal_surface"])
         title_row.pack(fill=tk.X)
         tk.Label(title_row, text=model_def["title"], bg=C["thermal_surface"], fg=C["text"], font=(FF, 11, "bold")).pack(side=tk.LEFT)
+        execTimeVar = tk.StringVar(value="")
+        self.modelExecTimeVars[model_key] = execTimeVar
+        tk.Label(
+            title_row,
+            textvariable=execTimeVar,
+            bg=C["thermal_surface"],
+            fg=C["muted"],
+            font=(FF, 8),
+        ).pack(side=tk.LEFT, padx=(6, 0), pady=(2, 0))
         badge_label = tk.Label(
             title_row,
             text="",
@@ -1532,7 +1622,9 @@ class HotspotBenchmarkApp:
 
     def _run_openvino_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
         del temperature_array, gt_hotspots
+        startedAt = time.perf_counter()
         detector_result = self._get_openvino_detector().detect(image_array)
+        executionTime = time.perf_counter() - startedAt
         return {
             "hotspots": [],
             "cover_result": self._make_polygon_cover_result(
@@ -1543,15 +1635,20 @@ class HotspotBenchmarkApp:
             "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
             "runtime_device": detector_result.runtime_device,
             "runtime_precision": self.openvinoPrecisionVar.get(),
+            "execution_time_s": executionTime,
         }
 
     def _run_opencv_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
         ordered_cover_points = self._order_cover_corners(gt_cover_box)
         cover_polygon = [ordered_cover_points[corner] for corner in ("TL", "TR", "BR", "BL")]
+        hotspotStartedAt = time.perf_counter()
         hotspot_result = self._get_opencv_detector().detect(
             self._to_thermal_matrix(image_array), temperature_array, roi_polygon=cover_polygon
         )
+        hotspotExecutionTime = time.perf_counter() - hotspotStartedAt
+        coverStartedAt = time.perf_counter()
         cover_detector_result = self._get_opencv_cover_detector().detect(self._to_thermal_matrix(image_array))
+        coverExecutionTime = time.perf_counter() - coverStartedAt
         predictions = self._prepare_predictions(hotspot_result, temperature_array)
         predictions = self._limit_predictions_to_gt_count(predictions, gt_hotspots)
         if not gt_hotspots:
@@ -1560,6 +1657,8 @@ class HotspotBenchmarkApp:
                 "success_rate": 0.0,
                 "inference_time_ms": cover_detector_result.inference_time_ms,
                 "fps": round(1000 / max(cover_detector_result.inference_time_ms, 0.001), 1),
+                "hotspot_execution_time_s": hotspotExecutionTime,
+                "execution_time_s": coverExecutionTime,
             }
 
         comparison_slots = self._make_comparison_slots(
@@ -1573,11 +1672,15 @@ class HotspotBenchmarkApp:
             "success_rate": round(100 * sum(slot["is_success"] for slot in comparison_slots) / len(gt_hotspots), 1),
             "inference_time_ms": cover_detector_result.inference_time_ms,
             "fps": round(1000 / max(cover_detector_result.inference_time_ms, 0.001), 1),
+            "hotspot_execution_time_s": hotspotExecutionTime,
+            "execution_time_s": coverExecutionTime,
         }
 
     def _run_pytorch_result(self, image_array: np.ndarray, temperature_array: np.ndarray, gt_hotspots: list[list[float]], gt_cover_box: dict) -> dict:
         del temperature_array, gt_hotspots
+        startedAt = time.perf_counter()
         detector_result = self._get_pytorch_detector().detect(image_array)
+        executionTime = time.perf_counter() - startedAt
         return {
             "hotspots": [],
             "cover_result": self._make_polygon_cover_result(
@@ -1586,6 +1689,7 @@ class HotspotBenchmarkApp:
             "success_rate": 0.0,
             "inference_time_ms": detector_result.inference_time_ms,
             "fps": round(1000 / max(detector_result.inference_time_ms, 0.001), 1),
+            "execution_time_s": executionTime,
         }
 
     def _compute_benchmark_results(self, image_file: str) -> None:
@@ -1597,7 +1701,9 @@ class HotspotBenchmarkApp:
             raise RuntimeError("Cannot compute benchmark results without a loaded thermal image")
         self._compute_all_image_results()
         self._load_cached_results_for_image(image_file)
+        summaryStartedAt = time.perf_counter()
         self.dataset_summary = self._compute_dataset_summary()
+        self.timingDetails["summaryCalculation"] += time.perf_counter() - summaryStartedAt
 
     def _compute_single_image_result(
         self,
@@ -1621,6 +1727,7 @@ class HotspotBenchmarkApp:
         self.current_hotspot_result = model_results["opencv"]
         self.current_cover_result = self._all_image_cover_results[image_file]
         self.dataset_summary = {}
+        self._update_execution_times([model_results])
 
     def _load_cached_results_for_image(self, image_file: str) -> None:
         """Look up already-computed per-image results (no inference) for Check Results browsing."""
@@ -1635,6 +1742,7 @@ class HotspotBenchmarkApp:
         self._all_image_model_results = {}
         self._all_image_cover_results = {}
         for image_file in self.image_list:
+            loadingStartedAt = time.perf_counter()
             gt_hotspots = self.gt_hotspot_map.get(image_file, [])
             image_array = data_loader.load_thermal_image(image_file)
             if image_array is None:
@@ -1646,6 +1754,7 @@ class HotspotBenchmarkApp:
             cover_box = data_loader.load_yolo_cover_box(image_file, width, height)
             if cover_box is None:
                 raise RuntimeError(f"Could not load YOLO C-Cover ground truth for: {image_file}")
+            self.timingDetails["dataLoading"] += time.perf_counter() - loadingStartedAt
             seed_text = f"{image_file}#run{self.run_counter}"
             self._all_image_model_results[image_file] = {
                 "opencv": self._run_opencv_result(image_array, temperature_array, gt_hotspots, cover_box),
@@ -1653,6 +1762,17 @@ class HotspotBenchmarkApp:
                 "openvino": self._run_openvino_result(image_array, temperature_array, gt_hotspots, cover_box),
             }
             self._all_image_cover_results[image_file] = self._all_image_model_results[image_file]["opencv"]["cover_result"]
+        self._update_execution_times(self._all_image_model_results.values())
+
+    def _update_execution_times(self, imageResultsCollection) -> None:
+        executionTimes = {key: 0.0 for key in self.executionTimes}
+        for imageResults in imageResultsCollection:
+            opencvResult = imageResults.get("opencv", {})
+            executionTimes["hotspot"] += float(opencvResult.get("hotspot_execution_time_s", 0.0))
+            for modelKey in MODEL_KEYS:
+                modelResult = imageResults.get(modelKey, {})
+                executionTimes[modelKey] += float(modelResult.get("execution_time_s", 0.0))
+        self.executionTimes = executionTimes
 
     def _compute_dataset_summary(self) -> dict[str, dict]:
         """Aggregate the cached per-image results (see _compute_all_image_results) across the
@@ -1852,8 +1972,10 @@ class HotspotBenchmarkApp:
         image_file = self._current_image_file()
         if not image_file or self._benchmark_running:
             return
+        self._runStartedAt = time.perf_counter()
         self._benchmark_running = True
         self.run_counter += 1
+        self._reset_execution_time_display()
         self._set_status("Processing", C["warning"])
         threading.Thread(target=self._run_current_image_worker, args=(image_file, True), daemon=True).start()
 
@@ -1861,16 +1983,19 @@ class HotspotBenchmarkApp:
         """Run all models for one randomly selected image from the dataset."""
         if not self.image_list or self._benchmark_running:
             return
+        self._runStartedAt = time.perf_counter()
         selected_index = random.randrange(len(self.image_list))
         self.image_index = selected_index
         self._benchmark_running = True
         self.run_counter += 1
+        self._reset_execution_time_display()
         self._set_status("Processing", C["warning"])
         image_file = self.image_list[selected_index]
         threading.Thread(target=self._run_current_image_worker, args=(image_file, False), daemon=True).start()
 
     def _run_current_image_worker(self, image_file: str, run_all_images: bool) -> None:
         try:
+            loadingStartedAt = time.perf_counter()
             image_array = data_loader.load_thermal_image(image_file)
             if image_array is None:
                 raise RuntimeError(f"Could not load thermal image: {image_file}")
@@ -1886,6 +2011,7 @@ class HotspotBenchmarkApp:
             if cover_box is None:
                 raise RuntimeError(f"Could not load YOLO C-Cover ground truth for: {image_file}")
             ground_truth_hotspots = self.gt_hotspot_map.get(image_file, [])
+            self.timingDetails["dataLoading"] += time.perf_counter() - loadingStartedAt
             self._image_array = image_array
             self._temperature_array = temperature_array
             self.current_cover_box = cover_box
@@ -1906,6 +2032,7 @@ class HotspotBenchmarkApp:
         ground_truth_hotspots: list[list[float]],
         image_file: str,
     ) -> None:
+        uiStartedAt = time.perf_counter()
         try:
             height, width = image_array.shape[:2]
             self._view_states = {
@@ -1946,18 +2073,126 @@ class HotspotBenchmarkApp:
                         f"Latency: {pytorch_result.get('inference_time_ms', 0.0):.1f} ms"
                     )
             self._redraw_panels()
+            self._show_execution_times()
             self.image_index_var.set(f"{self.image_index + 1} / {len(self.image_list)}")
             self._set_check_results_active(True)
             self._set_status("Completed", C["success"])
+            if self._runStartedAt is None:
+                raise RuntimeError("Run start time is unavailable")
+            preliminaryTotal = time.perf_counter() - self._runStartedAt
+            self.totalExecTimeVar.set(f"Total Exec Time: {preliminaryTotal:.2f}s")
+            self._totalExecTimeButton.pack(side=tk.LEFT, padx=(7, 0))
+            self.root.update_idletasks()
+            totalTime = time.perf_counter() - self._runStartedAt
+            self.timingDetails["uiRendering"] = time.perf_counter() - uiStartedAt
+            self.timingDetails["total"] = totalTime
+            self.totalExecTimeVar.set(f"Total Exec Time: {totalTime:.2f}s")
         except Exception as error:
             self._fail_benchmark_run(str(error))
         finally:
+            self._runStartedAt = None
             self._benchmark_running = False
 
     def _fail_benchmark_run(self, error_message: str) -> None:
         self._benchmark_running = False
+        self._runStartedAt = None
         messagebox.showerror("Load Error", error_message)
         self._set_status("Error", C["error"])
+
+    def _reset_execution_time_display(self) -> None:
+        self.executionTimes = {key: 0.0 for key in self.executionTimes}
+        self.timingDetails = {key: 0.0 for key in self.timingDetails}
+        self.totalExecTimeVar.set("")
+        self._totalExecTimeButton.pack_forget()
+        self.hotspotExecTimeVar.set("")
+        for execTimeVar in self.modelExecTimeVars.values():
+            execTimeVar.set("")
+
+    def _show_execution_times(self) -> None:
+        self.hotspotExecTimeVar.set(f'Exec Time: {self.executionTimes["hotspot"]:.2f}s')
+        for modelKey, execTimeVar in self.modelExecTimeVars.items():
+            execTimeVar.set(f'Exec Time: {self.executionTimes[modelKey]:.2f}s')
+
+    def _show_execution_time_details(self, triggerButton: tk.Button) -> None:
+        try:
+            totalTime = self.timingDetails["total"]
+            detectorTotal = sum(self.executionTimes.values())
+            processOverhead = max(0.0, totalTime - detectorTotal)
+            knownOverhead = (
+                self.timingDetails["dataLoading"]
+                + self.timingDetails["summaryCalculation"]
+                + self.timingDetails["uiRendering"]
+            )
+            otherOverhead = max(0.0, processOverhead - knownOverhead)
+            detectorRows = (
+                ("Hotspot Detection", self.executionTimes["hotspot"]),
+                ("OpenCV C-Cover", self.executionTimes["opencv"]),
+                ("PyTorch C-Cover", self.executionTimes["pytorch"]),
+                ("OpenVINO C-Cover", self.executionTimes["openvino"]),
+            )
+            overheadRows = (
+                ("Data Loading", self.timingDetails["dataLoading"]),
+                ("Summary Calculation", self.timingDetails["summaryCalculation"]),
+                ("UI Rendering", self.timingDetails["uiRendering"]),
+                ("Other / Scheduling", otherOverhead),
+            )
+
+            detailsWindow = tk.Toplevel(self.root)
+            detailsWindow.overrideredirect(True)
+            detailsWindow.configure(bg=C["thermal_surface"])
+            detailsWindow.resizable(False, False)
+            detailsWindow.transient(self.root)
+            content = tk.Frame(
+                detailsWindow, bg=C["thermal_surface"],
+                highlightbackground=C["border"], highlightthickness=1,
+            )
+            content.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+            tk.Label(
+                content, text="Execution Time Details", bg=C["thermal_surface"],
+                fg=C["text"], font=(FF, 12, "bold"),
+            ).pack(anchor=tk.W, padx=10, pady=(8, 6))
+            section = tk.Frame(content, bg=C["thermal_surface"])
+            section.pack(fill=tk.X, padx=10, pady=(5, 2))
+            tk.Label(
+                section, text=f"Total Exec Time: {totalTime:.3f}s",
+                bg=C["thermal_surface"], fg=C["cover_predicted"], font=(FF, 10, "bold"),
+            ).pack(anchor=tk.W)
+            for label, elapsedTime in detectorRows:
+                tk.Label(
+                    section, text=f"  -> {label}: {elapsedTime:.3f}s",
+                    bg=C["thermal_surface"], fg=C["muted"], font=(FF, 9),
+                ).pack(anchor=tk.W, pady=1)
+            tk.Label(
+                section, text=f"  -> Process Overhead: {processOverhead:.3f}s",
+                bg=C["thermal_surface"], fg=C["text"], font=(FF, 9, "bold"),
+            ).pack(anchor=tk.W, pady=(3, 1))
+            for label, elapsedTime in overheadRows:
+                tk.Label(
+                    section, text=f"      -> {label}: {elapsedTime:.3f}s",
+                    bg=C["thermal_surface"], fg=C["muted"], font=(FF, 9),
+                ).pack(anchor=tk.W, pady=1)
+            tk.Button(
+                content, text="Close", command=detailsWindow.destroy,
+                bg=C["thermal_surface"], fg=C["muted"],
+                activebackground=C["thermal_surface"], activeforeground=C["text"],
+                font=(FF, 9), relief=tk.FLAT, bd=0,
+                highlightbackground=C["border"], highlightthickness=1,
+                padx=8, pady=2, cursor="hand2",
+            ).pack(anchor=tk.E, padx=10, pady=(6, 8))
+            detailsWindow.update_idletasks()
+            popupWidth = detailsWindow.winfo_reqwidth()
+            popupX = triggerButton.winfo_rootx() + triggerButton.winfo_width() - popupWidth
+            popupY = triggerButton.winfo_rooty() + triggerButton.winfo_height() + 4
+            popupX = max(8, min(popupX, detailsWindow.winfo_screenwidth() - popupWidth - 8))
+            detailsWindow.geometry(f"+{popupX}+{popupY}")
+            detailsWindow.deiconify()
+            detailsWindow.lift(self.root)
+            detailsWindow.attributes("-topmost", True)
+            detailsWindow.after_idle(lambda: detailsWindow.attributes("-topmost", False))
+            detailsWindow.bind("<Escape>", lambda _event: detailsWindow.destroy())
+            detailsWindow.focus_force()
+        except Exception as error:
+            messagebox.showerror("Execution Time Details Error", str(error))
 
     def _show_placeholder_state(self) -> None:
         """Initial state before any run: leave the C-Cover status and thermal panels blank
@@ -2348,7 +2583,7 @@ class HotspotBenchmarkApp:
         )
         bottom_table.pack(fill=tk.X, pady=(4, 0))
         table_headers = ("Hotspot", "GT", "Pred", "Dist (px)", "Normalized Dist (%)", "Result")
-        table_widths = (12, 12, 12, 12, 16, 12)
+        table_widths = (10, 10, 10, 10, 24, 12)
         for column, header in enumerate(table_headers):
             tk.Label(
                 bottom_table, text=header, bg=C["thermal_surface"], fg=C["muted"],
